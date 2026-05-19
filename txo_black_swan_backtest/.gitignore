@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual / local packages
+.venv/
+venv/
+env/
+.python_packages/
+.matplotlib/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Reports / generated outputs
+reports/*.csv
+reports/*.md
+reports/charts/
+reports/*.png
+reports/*.jpg
+reports/*.jpeg
+reports/*.svg
+
+# Data files
+data/*.csv
+data/*.xlsx
+data/*.xls
+data/*.parquet
+data/*.zip
+
+# Logs
+*.log
+logs/
+
+# Local wrappers
+python.cmd
+pytest.cmd
+
+# Secrets / config overrides
+.env
+*.local
+config.local.py

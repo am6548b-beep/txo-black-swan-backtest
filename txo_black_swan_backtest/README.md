@@ -1,0 +1,113 @@
+# 台指選擇權黑天鵝對沖 + 恐慌退散賣波動回測框架
+
+這是一個保守、可驗證、可擴充的 Python MVP。它的第一目標不是找出最好看的績效，而是檢查台指選擇權策略能否降低黑天鵝期間的總資產最大回撤與爆倉風險。第二目標才是在恐慌退散後有限度收割波動率。
+
+## 策略說明
+
+狀態機：
+
+1. `NORMAL`
+2. `HEDGE_ON`：持有災難保險 Put Spread
+3. `PANIC`：市場下跌，等待 Put Spread 停利或風控出場
+4. `POST_PANIC`：等待 Iron Condor 條件
+5. `SHORT_VOL_ON`：持有有限風險 Iron Condor
+
+第一階段 Put Spread：
+
+- 高檔、低 VIX、過熱時建立。
+- 買入近價外 Put，賣出更遠價外 Put。
+- 依年度避險預算與股票 beta 曝險限制口數。
+- 到期前、停利、下跌幅度或殘值過低時出場。
+
+第二階段 Iron Condor：
+
+- 僅在 Put Spread 獲利後，或大跌後進入恐慌後狀態。
+- 要求 20 日大跌、從低點反彈、VIX 跌破 5MA、近 5 日不再破低。
+- Put 側較遠、Call 側略近，反映崩盤後 skew 與二次探底風險。
+- 禁止單邊 rolling；虧損側必須先整組出場，再重新滿足進場條件。
+
+## 資料格式
+
+放在 `data/`：
+
+- `market.csv`：`date, tx_close, tx_open, tx_high, tx_low, txf_close, volume, vix, event_flag`
+- `options.csv`：`date, expiry, dte, cp, strike, close, bid, ask, volume, open_interest, iv, delta`
+- `portfolio.csv` 可選：`date, stock_equity, portfolio_beta`
+
+如果缺少 `vix`，系統會用 20 日 realized volatility proxy，並發出 warning。如果缺少 `bid/ask`，會用 `estimated_spread` 估算。若缺少 `delta`，會用 Black-Scholes 估算；若缺少 `iv`，會反推 IV，失敗則該合約不可交易。
+
+## 如何執行
+
+安裝依賴：
+
+```bash
+pip install -r requirements.txt
+```
+
+基本回測：
+
+```bash
+python main.py --config config.py
+```
+
+模式：
+
+```bash
+python main.py --mode put_spread_only
+python main.py --mode iron_condor_only
+python main.py --mode full
+python main.py --mode stress
+python main.py --mode walk_forward
+```
+
+測試：
+
+```bash
+pytest
+```
+
+## 如何解讀報告
+
+輸出在 `reports/`：
+
+- `summary.csv`：每組參數或模式的總表，重點看 `max_drawdown`、`minimum_free_cash`、`margin_usage_max`、`cost_drag`。
+- `trades.csv`：每一腳成交紀錄，成交價使用 bid/ask 加滑價，不使用 close 當萬用成交價。
+- `equity_curve.csv`：每日現金、股票、選擇權、總權益、保證金使用率。
+- `regime_report.csv`：2008、2011、2015、2018、2020、2022、2024-2026 分段績效。
+- `stress_report.csv`：六種假想壓力情境，加上黑天鵝延後 6/9/12 個月的保費拖累測試。
+- `overfit_risk_report.csv`：粗網格鄰近參數穩定性標記。
+- `charts/`：權益曲線、回撤、年度避險成本、Put Spread payoff、Iron Condor PnL 分布、保證金使用率。
+
+請優先檢查：
+
+- 策略是否降低總資產最大回撤。
+- Put Spread 是否在崩盤期間補償股票虧損。
+- Iron Condor 是否在假反彈時被反殺。
+- 黑天鵝延後發生時，保費拖累是否可承受。
+- 任何結果是否只靠單一年份或單一參數點。
+
+## 避免過擬合原則
+
+- 不自動搜尋最佳 Sharpe、CAGR 或總報酬。
+- VIX 分位數只使用當日前資料。
+- Walk-forward 固定為：2008-2015 calibration、2016-2019 validation、2020-2026 test。
+- 參數只使用粗顆粒網格，不做細網格最佳化。
+- 若單點參數表現很好但鄰近參數差，標記為 `overfit_risk = HIGH`。
+- 不允許用 test 結果回頭調整參數。
+
+## 已知限制
+
+- 若缺乏真實 bid/ask，結果偏樂觀。
+- 若缺乏完整夜盤資料，跳空風險低估。
+- 若使用 Black-Scholes 估 Delta，不能完全反映台指選擇權 skew。
+- 過去黑天鵝不代表未來黑天鵝。
+- 回測只能驗證策略脆弱性，不能證明未來獲利。
+
+## 開發備註
+
+目前是 MVP，優先完成資料載入、無前視指標、合約選擇、Put Spread、Iron Condor、walk-forward、壓力測試與 pytest。後續接入真實期交所資料時，建議先強化：
+
+- 夜盤與跳空成交模型。
+- 真實保證金規則。
+- skew-aware delta / IV surface。
+- 可預知事件日資料來源與資料版本控管。
