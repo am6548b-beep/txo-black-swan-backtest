@@ -13,6 +13,8 @@ class Fill:
     cash_flow: float
     cost: float
     quantity: int
+    commission: float = 0.0
+    tax: float = 0.0
 
 
 def is_liquid(contract: OptionContract, config: dict) -> bool:
@@ -39,14 +41,19 @@ def fill_price(contract: OptionContract, side: str, config: dict, stress: bool =
 
     if config.get("debug_mid_fill", False):
         return (contract.bid + contract.ask) / 2.0
-    slip = float(config["stress_slippage_pct"] if stress else config["normal_slippage_pct"])
-    if contract.volume < float(config.get("wide_spread_volume_threshold", 50)):
-        slip = max(slip, float(config.get("stress_slippage_pct", slip)))
+    slip = slippage_pct(contract, config, stress)
     if side == "BUY":
         return contract.ask * (1.0 + slip)
     if side == "SELL":
         return max(0.0, contract.bid * (1.0 - slip))
     raise ValueError(f"Unknown side: {side}")
+
+
+def slippage_pct(contract: OptionContract, config: dict, stress: bool = False) -> float:
+    slip = float(config["stress_slippage_pct"] if stress else config["normal_slippage_pct"])
+    if contract.volume < float(config.get("wide_spread_volume_threshold", 50)):
+        slip = max(slip, float(config.get("stress_slippage_pct", slip)))
+    return slip
 
 
 def trade_contract(
@@ -72,7 +79,8 @@ def trade_contract(
     cost = commission + tax
     cash_flow = -gross - cost if side == "BUY" else gross - cost
     signed_qty = quantity if side == "BUY" else -quantity
-    fill = Fill(price=price, cash_flow=cash_flow, cost=cost, quantity=signed_qty)
+    fill = Fill(price=price, cash_flow=cash_flow, cost=cost, quantity=signed_qty, commission=commission, tax=tax)
+    liquidity_flag = "OK" if is_liquid(contract, config) else "LOW_LIQUIDITY"
     trade = Trade(
         date=date,
         position_id=position_id,
@@ -86,6 +94,18 @@ def trade_contract(
         cash_flow=cash_flow,
         cost=cost,
         reason=reason,
+        underlying_price_at_trade=contract.underlying,
+        txf_close_at_trade=contract.underlying,
+        option_bid_at_trade=contract.bid,
+        option_ask_at_trade=contract.ask,
+        option_close_at_trade=contract.close,
+        slippage_pct_used=slippage_pct(contract, config, stress),
+        commission_paid=commission,
+        tax_paid=tax,
+        liquidity_flag=liquidity_flag,
+        bid_ask_estimated=contract.bid_ask_estimated,
+        iv_estimated=contract.iv_estimated,
+        delta_estimated=contract.delta_estimated,
     )
     return fill, trade
 

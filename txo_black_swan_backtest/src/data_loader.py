@@ -143,10 +143,13 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
 
     options["cp"] = options["cp"].str.upper()
     estimated_spread = float(config.get("estimated_spread", 0.08))
+    bid_missing_initial = "bid" not in options.columns
+    ask_missing_initial = "ask" not in options.columns
     if "bid" not in options.columns:
         options["bid"] = np.nan
     if "ask" not in options.columns:
         options["ask"] = np.nan
+    options["bid_ask_estimated"] = bid_missing_initial | ask_missing_initial | options["bid"].isna() | options["ask"].isna()
     options["bid"] = options["bid"].fillna(options["close"] * (1.0 - estimated_spread)).clip(lower=0.0)
     options["ask"] = options["ask"].fillna(options["close"] * (1.0 + estimated_spread)).clip(lower=0.0)
     for col in ["volume", "open_interest"]:
@@ -163,10 +166,14 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
 
     iv_values: list[float | None] = []
     delta_values: list[float | None] = []
+    iv_estimated_values: list[bool] = []
+    delta_estimated_values: list[bool] = []
     tradable: list[bool] = []
     reasons: list[str] = []
     for row in options.itertuples(index=False):
-        iv = float(row.iv) if valid_number(row.iv) and float(row.iv) > 0 else None
+        iv_input_valid = valid_number(row.iv) and float(row.iv) > 0
+        iv = float(row.iv) if iv_input_valid else None
+        iv_estimated = False
         if iv is None and valid_number(row.underlying):
             iv = implied_vol(
                 float(row.close),
@@ -176,7 +183,10 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
                 rate,
                 row.cp,
             )
-        delta = float(row.delta) if valid_number(row.delta) else None
+            iv_estimated = iv is not None
+        delta_input_valid = valid_number(row.delta)
+        delta = float(row.delta) if delta_input_valid else None
+        delta_estimated = False
         if delta is None and iv is not None and valid_number(row.underlying):
             delta = bs_delta(
                 float(row.underlying),
@@ -186,16 +196,21 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
                 iv,
                 row.cp,
             )
+            delta_estimated = delta == delta
         is_tradable = iv is not None and delta is not None and float(row.ask) >= float(row.bid) >= 0
         reason = "" if is_tradable else "missing_iv_or_delta"
         iv_values.append(iv)
         delta_values.append(delta)
+        iv_estimated_values.append(iv_estimated)
+        delta_estimated_values.append(delta_estimated)
         tradable.append(is_tradable)
         reasons.append(reason)
     options["iv"] = iv_values
     options["delta"] = delta_values
     options["tradable"] = tradable
     options["reason"] = reasons
+    options["iv_estimated"] = iv_estimated_values
+    options["delta_estimated"] = delta_estimated_values
     return options.sort_values(["date", "expiry", "cp", "strike"]).reset_index(drop=True)
 
 

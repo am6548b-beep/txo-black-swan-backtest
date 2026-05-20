@@ -33,6 +33,9 @@ def row_to_contract(row) -> OptionContract:
         underlying=float(row.underlying),
         tradable=bool(row.tradable),
         reason=str(row.reason) if hasattr(row, "reason") else "",
+        bid_ask_estimated=bool(getattr(row, "bid_ask_estimated", False)),
+        iv_estimated=bool(getattr(row, "iv_estimated", False)),
+        delta_estimated=bool(getattr(row, "delta_estimated", False)),
     )
 
 

@@ -35,10 +35,26 @@ def run_report_audit(report_dir: Path) -> pd.DataFrame:
 def _audit_trades(trades: pd.DataFrame) -> list[dict]:
     rows = []
     required = {"date", "position_id", "strategy", "action", "cp", "strike", "expiry", "quantity", "price", "cash_flow", "cost", "reason"}
+    audit_cols = {
+        "underlying_price_at_trade",
+        "txf_close_at_trade",
+        "option_bid_at_trade",
+        "option_ask_at_trade",
+        "option_close_at_trade",
+        "slippage_pct_used",
+        "commission_paid",
+        "tax_paid",
+        "liquidity_flag",
+        "bid_ask_estimated",
+        "iv_estimated",
+        "delta_estimated",
+    }
     if trades.empty:
         return [_row("trades_integrity", "trades_csv_present", "FAIL", "trades.csv missing or empty")]
     missing = sorted(required - set(trades.columns))
     rows.append(_row("trades_integrity", "required_columns", "PASS" if not missing else "FAIL", ",".join(missing)))
+    missing_audit = sorted(audit_cols - set(trades.columns))
+    rows.append(_row("trades_integrity", "audit_columns_present", "PASS" if not missing_audit else "WARN", ",".join(missing_audit)))
     if missing:
         return rows
 
@@ -80,15 +96,20 @@ def _audit_strikes(trades: pd.DataFrame) -> list[dict]:
             continue
         long_strike = float(buys["strike"].max())
         short_strike = float(sells["strike"].min())
-        implied_underlying = long_strike / 0.90
-        long_ratio = long_strike / implied_underlying
-        short_ratio = short_strike / implied_underlying
+        if "txf_close_at_trade" not in group or group["txf_close_at_trade"].isna().all():
+            implied_underlying = long_strike / 0.90
+            long_ratio = long_strike / implied_underlying
+            short_ratio = short_strike / implied_underlying
+            rows.append(_row("strike_reasonableness", "txf_close_available", "WARN", f"{pid}: txf_close_at_trade missing; using proxy"))
+        else:
+            txf = float(group["txf_close_at_trade"].dropna().iloc[0])
+            long_ratio = long_strike / txf
+            short_ratio = short_strike / txf
         long_ok = min(abs(long_ratio - 0.90), abs(long_ratio - 0.93)) <= 0.04
         short_ok = min(abs(short_ratio - 0.75), abs(short_ratio - 0.78)) <= 0.06
         status = "PASS" if long_ok and short_ok else "WARN"
-        detail = f"{pid}: report lacks txf_close; using long_put/0.90 implied reference. long_ratio={long_ratio:.3f}, short_ratio={short_ratio:.3f}"
-        rows.append(_row("strike_reasonableness", "put_spread_moneyness_proxy", status, detail))
-    rows.append(_row("strike_reasonableness", "txf_close_available", "WARN", "reports do not include txf_close, exact moneyness cannot be verified from report-only inputs"))
+        detail = f"{pid}: long_ratio={long_ratio:.3f}, short_ratio={short_ratio:.3f}"
+        rows.append(_row("strike_reasonableness", "put_spread_moneyness", status, detail))
     return rows
 
 
@@ -100,11 +121,39 @@ def _audit_execution_prices(trades: pd.DataFrame) -> list[dict]:
     sell_ok = (trades.loc[trades["action"] == "SELL", "cash_flow"] > 0).all()
     rows.append(_row("execution_reasonableness", "buy_cash_flow_negative", "PASS" if buy_ok else "FAIL", "BUY should consume cash"))
     rows.append(_row("execution_reasonableness", "sell_cash_flow_positive", "PASS" if sell_ok else "FAIL", "SELL should add cash after costs"))
-    rows.append(_row("execution_reasonableness", "bid_ask_slippage_verifiable", "WARN", "trades.csv has fill price only; bid/ask/close are not present, so audit cannot prove ask+slippage or bid-slippage from reports alone"))
-    rows.append(_row("execution_reasonableness", "close_not_used_as_universal_fill", "WARN", "close column is absent from trades.csv; no evidence of close fills in report, but raw quote audit is required for proof"))
+    needed = {"option_bid_at_trade", "option_ask_at_trade", "option_close_at_trade", "slippage_pct_used"}
+    if needed <= set(trades.columns):
+        expected = []
+        for row in trades.itertuples(index=False):
+            slip = float(getattr(row, "slippage_pct_used"))
+            if row.action == "BUY":
+                expected.append(float(row.option_ask_at_trade) * (1.0 + slip))
+            elif row.action == "SELL":
+                expected.append(max(0.0, float(row.option_bid_at_trade) * (1.0 - slip)))
+            else:
+                expected.append(np.nan)
+        diff = (pd.Series(expected) - pd.to_numeric(trades["price"], errors="coerce")).abs()
+        rows.append(_row("execution_reasonableness", "bid_ask_slippage_fill_price", "PASS" if diff.max() < 1e-8 else "FAIL", f"max_abs_diff={diff.max():.10f}"))
+        close_fill = (pd.to_numeric(trades["price"], errors="coerce") - pd.to_numeric(trades["option_close_at_trade"], errors="coerce")).abs() < 1e-10
+        rows.append(_row("execution_reasonableness", "close_not_used_as_universal_fill", "PASS" if not close_fill.all() else "FAIL", f"close_equal_fill_legs={int(close_fill.sum())}"))
+    else:
+        rows.append(_row("execution_reasonableness", "bid_ask_slippage_fill_price", "WARN", f"missing columns={sorted(needed - set(trades.columns))}"))
+        rows.append(_row("execution_reasonableness", "close_not_used_as_universal_fill", "WARN", "option_close_at_trade unavailable"))
+    if "bid_ask_estimated" in trades:
+        estimated = _bool_series(trades["bid_ask_estimated"])
+        rows.append(_row("execution_reasonableness", "bid_ask_estimated_flag", "WARN" if estimated.any() else "PASS", f"estimated_legs={int(estimated.sum())}"))
+    else:
+        rows.append(_row("execution_reasonableness", "bid_ask_estimated_flag", "WARN", "bid_ask_estimated column missing"))
+    for col in ["iv_estimated", "delta_estimated"]:
+        if col in trades:
+            estimated = _bool_series(trades[col])
+            rows.append(_row("execution_reasonableness", col, "WARN" if estimated.any() else "PASS", f"estimated_legs={int(estimated.sum())}"))
+    if {"commission_paid", "tax_paid"} <= set(trades.columns):
+        cost_diff = (pd.to_numeric(trades["commission_paid"], errors="coerce") + pd.to_numeric(trades["tax_paid"], errors="coerce") - pd.to_numeric(trades["cost"], errors="coerce")).abs().max()
+        rows.append(_row("execution_reasonableness", "commission_tax_sum_to_cost", "PASS" if cost_diff < 1e-8 else "FAIL", f"max_abs_diff={cost_diff:.10f}"))
     total_cost = float(trades["cost"].sum()) if "cost" in trades else 0.0
     turnover = float(trades["cash_flow"].abs().sum()) if "cash_flow" in trades else 0.0
-    rows.append(_row("execution_reasonableness", "fee_tax_cost_summary", "PASS", f"reported_cost={total_cost:.2f}, turnover={turnover:.2f}; slippage is embedded in fill price and cannot be separated without quote snapshot"))
+    rows.append(_row("execution_reasonableness", "fee_tax_cost_summary", "PASS", f"reported_cost={total_cost:.2f}, turnover={turnover:.2f}; slippage_pct_used is now recorded per leg"))
     return rows
 
 
@@ -222,6 +271,12 @@ def _finite_check(category: str, check: str, series: pd.Series, positive: bool =
     if positive:
         finite = finite and (values > 0).all()
     return _row(category, check, "PASS" if finite else "FAIL", "")
+
+
+def _bool_series(series: pd.Series) -> pd.Series:
+    if series.dtype == bool:
+        return series.fillna(False)
+    return series.astype(str).str.lower().isin({"true", "1", "yes", "y"})
 
 
 def _status_from_item(status_map: dict, item: str) -> str:

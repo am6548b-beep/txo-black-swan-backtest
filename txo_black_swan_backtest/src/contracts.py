@@ -39,6 +39,9 @@ class OptionContract:
     underlying: float
     tradable: bool = True
     reason: str = ""
+    bid_ask_estimated: bool = False
+    iv_estimated: bool = False
+    delta_estimated: bool = False
 
 
 @dataclass
@@ -97,6 +100,18 @@ class Trade:
     cash_flow: float
     cost: float
     reason: str
+    underlying_price_at_trade: float | None = None
+    txf_close_at_trade: float | None = None
+    option_bid_at_trade: float | None = None
+    option_ask_at_trade: float | None = None
+    option_close_at_trade: float | None = None
+    slippage_pct_used: float | None = None
+    commission_paid: float = 0.0
+    tax_paid: float = 0.0
+    liquidity_flag: str = ""
+    bid_ask_estimated: bool = False
+    iv_estimated: bool = False
+    delta_estimated: bool = False
 
 
 @dataclass

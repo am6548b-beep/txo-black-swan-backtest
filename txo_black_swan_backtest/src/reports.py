@@ -10,7 +10,32 @@ import pandas as pd
 from .metrics import regime_report, summarize, trade_pnl
 from .macro_regime import write_macro_reports
 
-TRADE_COLUMNS = ["date", "position_id", "strategy", "action", "cp", "strike", "expiry", "quantity", "price", "cash_flow", "cost", "reason"]
+TRADE_COLUMNS = [
+    "date",
+    "position_id",
+    "strategy",
+    "action",
+    "cp",
+    "strike",
+    "expiry",
+    "quantity",
+    "price",
+    "cash_flow",
+    "cost",
+    "reason",
+    "underlying_price_at_trade",
+    "txf_close_at_trade",
+    "option_bid_at_trade",
+    "option_ask_at_trade",
+    "option_close_at_trade",
+    "slippage_pct_used",
+    "commission_paid",
+    "tax_paid",
+    "liquidity_flag",
+    "bid_ask_estimated",
+    "iv_estimated",
+    "delta_estimated",
+]
 EQUITY_COLUMNS = [
     "date",
     "cash",
