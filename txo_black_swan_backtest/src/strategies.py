@@ -10,6 +10,7 @@ import pandas as pd
 
 from .contracts import Leg, OptionContract, Position, StrategyState, Trade
 from .execution import close_leg, fill_price, is_liquid, is_stress_day, trade_contract
+from .macro_regime import macro_restrictions
 from .portfolio import make_state
 from .risk import can_add_margin, iron_condor_margin, min_dte, short_delta_breached, short_strike_touched
 from .utils import year_key
@@ -187,6 +188,10 @@ class BlackSwanStateMachine:
                 prev_stock,
                 prev_option_value,
                 warning,
+                str(getattr(row, "macro_state", "NORMAL")),
+                float(getattr(row, "SupplyStressIndex", 0.0)),
+                float(getattr(row, "MacroDemandFragilityIndex", 0.0)),
+                float(getattr(row, "CombinedRiskScore", 0.0)),
             )
             self.states.append(asdict(state))
             prev_stock = stock_equity
@@ -236,15 +241,18 @@ class BlackSwanStateMachine:
             return
         if any(pd.isna(x) for x in [row.ma200, row.ret_126d, row.vix_percentile_3y]):
             return
+        macro_state = str(getattr(row, "macro_state", "NORMAL"))
+        restriction = macro_restrictions(macro_state)
+        vix_threshold = 40.0 if macro_state == "STAGFLATION_PRESSURE" and float(getattr(row, "ValuationRiskIndex", 0.0)) > 70.0 else 30.0
         if not (
             row.tx_close > row.ma200
             and row.ret_126d > 0.20
-            and row.vix_percentile_3y < 30.0
+            and row.vix_percentile_3y < vix_threshold
             and int(row.event_flag) == 0
         ):
             return
         year = year_key(row.date)
-        budget_cap = float(self.config["max_annual_hedge_budget_pct"]) * stock_equity
+        budget_cap = float(self.config["max_annual_hedge_budget_pct"]) * float(restriction["hedge_budget_multiplier"]) * stock_equity
         used = self.annual_hedge_spend.get(year, 0.0)
         if used >= budget_cap:
             return
@@ -253,7 +261,7 @@ class BlackSwanStateMachine:
         long_m = self.put_params["long_put_moneyness_low_vix"] if low_vix else self.put_params["long_put_moneyness"]
         short_m = self.put_params["short_put_moneyness_low_vix"] if low_vix else self.put_params["short_put_moneyness"]
         dte_min = int(self.put_params["target_dte_min"])
-        dte_max = int(self.put_params["target_dte_max"])
+        dte_max = int(self.put_params["target_dte_max"]) + int(restriction["extend_put_dte"])
         date = pd.Timestamp(row.date)
         long_put = self.selector.nearest_strike(date, "P", row.txf_close * long_m, dte_min, dte_max)
         if long_put is None:
@@ -359,6 +367,10 @@ class BlackSwanStateMachine:
     def _check_ic_entry(self, row, stock_equity: float) -> None:
         if self._open_positions("iron_condor"):
             return
+        macro_state = str(getattr(row, "macro_state", "NORMAL"))
+        restriction = macro_restrictions(macro_state)
+        if bool(restriction["block_new_ic"]):
+            return
         if self.mode == "full" and self.state not in {StrategyState.POST_PANIC, StrategyState.PANIC}:
             return
         needed = [row.drawdown_20d_from_high, row.rolling_20d_low, row.vix_5ma]
@@ -402,11 +414,13 @@ class BlackSwanStateMachine:
         allowed = min(
             (self.cash + stock_equity) * float(self.ic_params["max_total_asset_loss_pct"]),
             max(0.0, self.realized_hedge_profit) * float(self.ic_params["max_hedge_profit_giveback_pct"]) if self.mode == "full" else (self.cash + stock_equity) * 0.01,
-        )
+        ) * float(restriction["ic_risk_multiplier"])
         qty = int(allowed // max_loss_per)
         if qty <= 0:
             return
-        if not can_add_margin(self._required_margin(), max_loss_per * qty, self.cash + stock_equity, self.cash, self.config):
+        margin_config = self.config.copy()
+        margin_config["min_free_cash_multiplier"] = float(self.config.get("min_free_cash_multiplier", 2.0)) * float(restriction["free_cash_multiplier"])
+        if not can_add_margin(self._required_margin(), max_loss_per * qty, self.cash + stock_equity, self.cash, margin_config):
             return
         pos_id = f"IC-{next(self.position_counter)}"
         fills_trades = [

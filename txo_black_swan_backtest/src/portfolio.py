@@ -15,6 +15,10 @@ def make_state(
     previous_stock_equity: float | None = None,
     previous_option_value: float | None = None,
     warning: str = "",
+    macro_state: str = "NORMAL",
+    supply_stress_index: float = 0.0,
+    macro_demand_fragility_index: float = 0.0,
+    combined_risk_score: float = 0.0,
 ) -> PortfolioState:
     total = cash + stock_equity + option_value
     free_cash = cash - required_margin
@@ -29,8 +33,11 @@ def make_state(
         required_margin=required_margin,
         margin_usage=margin_usage,
         state=state,
+        macro_state=macro_state,
+        supply_stress_index=supply_stress_index,
+        macro_demand_fragility_index=macro_demand_fragility_index,
+        combined_risk_score=combined_risk_score,
         daily_stock_pnl=0.0 if previous_stock_equity is None else stock_equity - previous_stock_equity,
         daily_option_pnl=0.0 if previous_option_value is None else option_value - previous_option_value,
         warning=warning,
     )
-

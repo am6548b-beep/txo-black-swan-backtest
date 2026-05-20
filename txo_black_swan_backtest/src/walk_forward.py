@@ -43,14 +43,24 @@ def run_walk_forward(
     param_rows = coarse_grid(grid)
     for i, params in enumerate(param_rows, 1):
         put, ic = apply_grid_params(base_put, base_ic, params)
-        equity, trades, _ = run_backtest(data_dir, config, put, ic, mode="full")
+        equity, trades, market = run_backtest(data_dir, config, put, ic, mode="full")
         if equity.empty:
             rows.append({"param_id": i, **params, "note": "no_data"})
             continue
         equity["date"] = pd.to_datetime(equity["date"])
         for window, (start, end) in windows.items():
             sub = equity[(equity["date"] >= pd.Timestamp(start)) & (equity["date"] <= pd.Timestamp(end))]
-            rows.append({"param_id": i, "window": window, **params, **summarize(sub, trades, f"param_{i}_{window}")})
+            market_sub = market[(market["date"] >= pd.Timestamp(start)) & (market["date"] <= pd.Timestamp(end))] if not market.empty else market
+            diagnostics = {
+                "max_supply_stress_index": float(market_sub["SupplyStressIndex"].max()) if not market_sub.empty and "SupplyStressIndex" in market_sub else 0.0,
+                "max_macro_demand_fragility_index": float(market_sub["MacroDemandFragilityIndex"].max()) if not market_sub.empty and "MacroDemandFragilityIndex" in market_sub else 0.0,
+                "max_combined_risk_score": float(market_sub["CombinedRiskScore"].max()) if not market_sub.empty and "CombinedRiskScore" in market_sub else 0.0,
+                "ai_supply_distortion_days": int((market_sub["macro_state"] == "AI_SUPPLY_DISTORTION").sum()) if not market_sub.empty and "macro_state" in market_sub else 0,
+                "bullwhip_collapse_days": int((market_sub["macro_state"] == "BULLWHIP_COLLAPSE").sum()) if not market_sub.empty and "macro_state" in market_sub else 0,
+                "stagflation_pressure_days": int((market_sub["macro_state"] == "STAGFLATION_PRESSURE").sum()) if not market_sub.empty and "macro_state" in market_sub else 0,
+                "stagflation_demand_break_days": int((market_sub["macro_state"] == "STAGFLATION_DEMAND_BREAK").sum()) if not market_sub.empty and "macro_state" in market_sub else 0,
+            }
+            rows.append({"param_id": i, "window": window, **params, **summarize(sub, trades, f"param_{i}_{window}"), **diagnostics})
     summary = pd.DataFrame(rows)
     return summary, stability_report(summary)
 
@@ -83,4 +93,3 @@ def stability_report(summary: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
-

@@ -40,6 +40,44 @@ OPTION_COLUMNS = [
 
 PORTFOLIO_COLUMNS = ["date", "stock_equity", "portfolio_beta"]
 
+MACRO_FACTOR_COLUMNS = [
+    "date",
+    "hbm_asp_index",
+    "ddr5_spot_index",
+    "pc_shipments_yoy",
+    "smartphone_shipments_yoy",
+    "pc_sellthrough_yoy",
+    "inventory_days_oem",
+    "inventory_days_components",
+    "pcb_revenue_yoy",
+    "mlcc_revenue_yoy",
+    "driver_ic_revenue_yoy",
+    "unit_growth_yoy",
+    "asp_growth_yoy",
+    "ai_server_capex_yoy",
+    "consumer_sentiment",
+    "cpi_yoy",
+    "core_cpi_yoy",
+    "ppi_yoy",
+    "real_wage_growth_yoy",
+    "consumer_confidence",
+    "unemployment_rate",
+    "policy_rate",
+    "us10y_yield",
+    "credit_card_delinquency",
+    "oil_price_yoy",
+    "usd_index",
+    "retail_sales_yoy",
+    "sox_relative_strength",
+    "tsmc_relative_strength",
+    "memory_relative_strength",
+    "pcb_relative_strength",
+    "mlcc_relative_strength",
+    "valuation_risk_index",
+    "liquidity_stress_index",
+    "event_flag",
+]
+
 
 def _empty_frame(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
@@ -53,6 +91,7 @@ def create_sample_csvs(data_dir: Path) -> None:
         "market.csv": MARKET_COLUMNS,
         "options.csv": OPTION_COLUMNS,
         "portfolio.csv": PORTFOLIO_COLUMNS,
+        "macro_factors.csv": MACRO_FACTOR_COLUMNS,
     }.items():
         path = data_dir / name
         if not path.exists():
@@ -190,3 +229,21 @@ def _synthetic_portfolio(market: pd.DataFrame, config: dict) -> pd.DataFrame:
         }
     )
 
+
+def load_macro_factors(data_dir: Path) -> pd.DataFrame:
+    """Load optional macro factors used for supply-chain regime diagnostics."""
+
+    path = data_dir / "macro_factors.csv"
+    if not path.exists():
+        warn(f"Missing {path}; creating empty template.")
+        create_sample_csvs(data_dir)
+        return _empty_frame(MACRO_FACTOR_COLUMNS)
+    macro = pd.read_csv(path, parse_dates=["date"])
+    if macro.empty:
+        return macro
+    if "date" not in macro.columns:
+        raise ValueError("macro_factors.csv missing required column: date")
+    for col in MACRO_FACTOR_COLUMNS:
+        if col not in macro.columns:
+            macro[col] = np.nan if col != "event_flag" else 0
+    return macro[MACRO_FACTOR_COLUMNS].sort_values("date").reset_index(drop=True)

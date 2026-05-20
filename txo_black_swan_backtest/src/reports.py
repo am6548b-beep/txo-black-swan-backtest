@@ -8,9 +8,27 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from .metrics import regime_report, summarize, trade_pnl
+from .macro_regime import write_macro_reports
 
 TRADE_COLUMNS = ["date", "position_id", "strategy", "action", "cp", "strike", "expiry", "quantity", "price", "cash_flow", "cost", "reason"]
-EQUITY_COLUMNS = ["date", "cash", "stock_equity", "option_value", "total_equity", "free_cash", "required_margin", "margin_usage", "state", "daily_stock_pnl", "daily_option_pnl", "warning"]
+EQUITY_COLUMNS = [
+    "date",
+    "cash",
+    "stock_equity",
+    "option_value",
+    "total_equity",
+    "free_cash",
+    "required_margin",
+    "margin_usage",
+    "state",
+    "macro_state",
+    "supply_stress_index",
+    "macro_demand_fragility_index",
+    "combined_risk_score",
+    "daily_stock_pnl",
+    "daily_option_pnl",
+    "warning",
+]
 
 
 def write_reports(
@@ -21,6 +39,7 @@ def write_reports(
     label: str = "base",
     overfit: pd.DataFrame | None = None,
     stress: pd.DataFrame | None = None,
+    market: pd.DataFrame | None = None,
 ) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     charts = report_dir / "charts"
@@ -29,8 +48,16 @@ def write_reports(
     (trades if not trades.empty else pd.DataFrame(columns=TRADE_COLUMNS)).to_csv(report_dir / "trades.csv", index=False)
     (equity if not equity.empty else pd.DataFrame(columns=EQUITY_COLUMNS)).to_csv(report_dir / "equity_curve.csv", index=False)
     regime_report(equity, regimes).to_csv(report_dir / "regime_report.csv", index=False)
-    (stress if stress is not None else pd.DataFrame()).to_csv(report_dir / "stress_report.csv", index=False)
-    (overfit if overfit is not None else pd.DataFrame()).to_csv(report_dir / "overfit_risk_report.csv", index=False)
+    if stress is not None:
+        stress.to_csv(report_dir / "stress_report.csv", index=False)
+    elif not (report_dir / "stress_report.csv").exists():
+        pd.DataFrame().to_csv(report_dir / "stress_report.csv", index=False)
+    if overfit is not None:
+        overfit.to_csv(report_dir / "overfit_risk_report.csv", index=False)
+    elif not (report_dir / "overfit_risk_report.csv").exists():
+        pd.DataFrame().to_csv(report_dir / "overfit_risk_report.csv", index=False)
+    if market is not None and not market.empty:
+        write_macro_reports(report_dir, market, trades if not trades.empty else pd.DataFrame(columns=TRADE_COLUMNS))
     if not equity.empty:
         _plot_equity(equity, charts)
         _plot_drawdown(equity, charts)

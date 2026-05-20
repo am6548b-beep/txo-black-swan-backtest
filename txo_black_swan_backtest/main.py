@@ -64,8 +64,8 @@ def main() -> None:
         print(f"Walk-forward reports written to {root / 'reports'}")
         return
 
-    equity, trades, _ = run_backtest(root / "data", config, put_params, ic_params, mode=args.mode)
-    write_reports(root / "reports", equity, trades, regimes, label=args.mode)
+    equity, trades, market = run_backtest(root / "data", config, put_params, ic_params, mode=args.mode)
+    write_reports(root / "reports", equity, trades, regimes, label=args.mode, market=market)
     print(f"Reports written to {root / 'reports'}")
 
 

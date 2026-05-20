@@ -16,6 +16,10 @@ class StrategyState(str, Enum):
     PANIC = "PANIC"
     POST_PANIC = "POST_PANIC"
     SHORT_VOL_ON = "SHORT_VOL_ON"
+    AI_SUPPLY_DISTORTION = "AI_SUPPLY_DISTORTION"
+    BULLWHIP_COLLAPSE = "BULLWHIP_COLLAPSE"
+    STAGFLATION_PRESSURE = "STAGFLATION_PRESSURE"
+    STAGFLATION_DEMAND_BREAK = "STAGFLATION_DEMAND_BREAK"
 
 
 @dataclass(frozen=True)
@@ -106,7 +110,10 @@ class PortfolioState:
     required_margin: float
     margin_usage: float
     state: StrategyState
+    macro_state: str = "NORMAL"
+    supply_stress_index: float = 0.0
+    macro_demand_fragility_index: float = 0.0
+    combined_risk_score: float = 0.0
     daily_stock_pnl: float = 0.0
     daily_option_pnl: float = 0.0
     warning: str = ""
-

@@ -95,6 +95,53 @@ pytest
 - 若單點參數表現很好但鄰近參數差，標記為 `overfit_risk = HIGH`。
 - 不允許用 test 結果回頭調整參數。
 
+## AI Supply Distortion & Bullwhip Risk
+
+這不是單純 AI 泡沫模型，而是監控：
+
+AI 高獲利資源虹吸導致 HBM 產能優先、傳統 DRAM 供給被擠壓，進而推升 DDR5 / DDR4、PCB、MLCC、Driver IC 等供應鏈恐慌性拉貨。若終端 PC / smartphone / 3C sell-through 無法承接高 ASP，假繁榮可能反轉為庫存與砍單長鞭效應。
+
+新增 `data/macro_factors.csv` 支援：
+
+- AI supply inputs：`hbm_asp_index`、`ddr5_spot_index`、`pcb_revenue_yoy`、`mlcc_revenue_yoy`、`driver_ic_revenue_yoy`、`inventory_days_oem`、`inventory_days_components`、`unit_growth_yoy`、`asp_growth_yoy`
+- Demand inputs：`pc_shipments_yoy`、`smartphone_shipments_yoy`、`pc_sellthrough_yoy`、`consumer_sentiment`
+- Stagflation amplifier：`cpi_yoy`、`core_cpi_yoy`、`ppi_yoy`、`real_wage_growth_yoy`、`consumer_confidence`、`unemployment_rate`、`policy_rate`、`us10y_yield`、`credit_card_delinquency`、`oil_price_yoy`、`retail_sales_yoy`
+
+新增指標：
+
+- `SupplyStressIndex`：0-100，監控 HBM/DDR5 價差、DDR5 加速、零組件營收加速、庫存背離、ASP 與 unit growth 背離、消費信心惡化、sell-through 轉弱。
+- `MacroDemandFragilityIndex`：0-100，監控通膨、PPI、實質薪資、消費信心、失業率、利率、信用卡延滯、油價與零售銷售。
+- `CombinedRiskScore = 0.4 * SupplyStressIndex + 0.3 * MacroDemandFragilityIndex + 0.2 * ValuationRiskIndex + 0.1 * LiquidityStressIndex`
+
+新增 macro states：
+
+- `AI_SUPPLY_DISTORTION`
+- `BULLWHIP_COLLAPSE`
+- `STAGFLATION_PRESSURE`
+- `STAGFLATION_DEMAND_BREAK`
+
+系統不預測崩盤時間，而是監控：
+
+- 假繁榮
+- 庫存異常
+- ASP 與 unit growth 背離
+- consumer demand weakening
+- inventory shock risk
+- AI bullwhip 與 stagflation 同時存在時的灰犀牛轉黑天鵝風險
+
+新增報告：
+
+- `reports/macro_dashboard.csv`
+- `reports/macro_dashboard.md`
+- `reports/report_audit.csv`
+
+避免過擬合限制：
+
+- 不用事後已知崩盤時間調整 `SupplyStressIndex` 門檻。
+- 不用單一記憶體週期最佳化。
+- 不用 2026-2027 假設反推參數。
+- 僅使用 `LOW` / `MEDIUM` / `HIGH` / `EXTREME` 粗顆粒 regime。
+
 ## 已知限制
 
 - 若缺乏真實 bid/ask，結果偏樂觀。

@@ -25,6 +25,9 @@ def is_liquid(contract: OptionContract, config: dict) -> bool:
 
 
 def is_stress_day(market_row, config: dict) -> bool:
+    macro_state = str(getattr(market_row, "macro_state", "NORMAL"))
+    if macro_state in {"BULLWHIP_COLLAPSE", "STAGFLATION_DEMAND_BREAK"}:
+        return True
     pct = getattr(market_row, "vix_percentile_3y", None)
     if pct is not None and pct == pct and pct >= float(config.get("stress_vix_percentile", 80.0)):
         return True
@@ -114,4 +117,3 @@ def close_leg(
         reason,
         stress,
     )
-

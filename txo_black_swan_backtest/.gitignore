@@ -30,11 +30,9 @@ reports/*.jpeg
 reports/*.svg
 
 # Data files
-data/*.csv
-data/*.xlsx
-data/*.xls
-data/*.parquet
-data/*.zip
+data/*
+!data/sample/
+!data/sample/*.csv
 
 # Logs
 *.log

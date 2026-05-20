@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data_loader import MARKET_COLUMNS, OPTION_COLUMNS, PORTFOLIO_COLUMNS
+from .data_loader import MACRO_FACTOR_COLUMNS, MARKET_COLUMNS, OPTION_COLUMNS, PORTFOLIO_COLUMNS
 
 
 def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFrame:
@@ -22,10 +22,12 @@ def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFram
         )
     )
     rows.extend(_validate_csv(data_dir / "portfolio.csv", PORTFOLIO_COLUMNS, required=[]))
+    rows.extend(_validate_csv(data_dir / "macro_factors.csv", MACRO_FACTOR_COLUMNS, required=["date"]))
 
     market = _read_csv(data_dir / "market.csv", ["date"])
     options = _read_csv(data_dir / "options.csv", ["date", "expiry"])
     portfolio = _read_csv(data_dir / "portfolio.csv", ["date"])
+    macro = _read_csv(data_dir / "macro_factors.csv", ["date"])
 
     if not market.empty:
         rows.extend(_date_checks("market.csv", market, "date"))
@@ -53,6 +55,12 @@ def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFram
         rows.extend(_date_checks("portfolio.csv", portfolio, "date"))
         beta_ok = "portfolio_beta" in portfolio
         rows.append(_check("portfolio.csv", "portfolio_beta_available", "PASS" if beta_ok else "WARN", "portfolio_beta present" if beta_ok else "missing portfolio uses config beta"))
+    if not macro.empty:
+        rows.extend(_date_checks("macro_factors.csv", macro, "date"))
+        supply_cols = {"hbm_asp_index", "ddr5_spot_index", "inventory_days_components", "pc_sellthrough_yoy"}
+        fragility_cols = {"cpi_yoy", "core_cpi_yoy", "real_wage_growth_yoy", "consumer_confidence"}
+        rows.append(_check("macro_factors.csv", "supply_distortion_columns", "PASS" if supply_cols <= set(macro.columns) else "WARN", "AI supply distortion inputs present" if supply_cols <= set(macro.columns) else "missing some AI supply inputs"))
+        rows.append(_check("macro_factors.csv", "macro_fragility_columns", "PASS" if fragility_cols <= set(macro.columns) else "WARN", "macro demand fragility inputs present" if fragility_cols <= set(macro.columns) else "missing some macro fragility inputs"))
 
     report = pd.DataFrame(rows)
     report_dir.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,6 @@ import pandas as pd
 
 from .backtester import run_backtest
 from .metrics import max_drawdown
-from .option_pricing import bs_delta, bs_price
 
 
 SCENARIOS = {
@@ -20,6 +19,8 @@ SCENARIOS = {
     "D_v_reversal": "Down 18%, then +15% in 7 days",
     "E_ai_bubble_ipo_liquidity": "Index -20%, portfolio beta temporarily 1.8-2.2",
     "F_carry_unwind_gap": "Gap risk, 3-5x bid/ask, 4x slippage proxy",
+    "G_ai_supply_distortion": "HBM +80%, DDR5 +60%, components +40%, units +5%, sentiment weakens",
+    "H_bullwhip_collapse": "PC -15%, smartphone -12%, inventory spike, components collapse, TX -18%, VIX jump",
 }
 
 
@@ -27,11 +28,13 @@ def run_stress_suite(config: dict, put_params: dict, ic_params: dict) -> pd.Data
     rows = []
     for name in SCENARIOS:
         market = synthetic_market(name)
+        macro = synthetic_macro_factors(market, name)
         options = synthetic_options(market, config, wide_spread=name.startswith("F_"))
         portfolio = synthetic_portfolio(market, config, high_beta=name.startswith("E_"))
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             market.to_csv(data_dir / "market.csv", index=False)
+            macro.to_csv(data_dir / "macro_factors.csv", index=False)
             options.to_csv(data_dir / "options.csv", index=False)
             portfolio.to_csv(data_dir / "portfolio.csv", index=False)
             cfg = config.copy()
@@ -57,6 +60,9 @@ def run_stress_suite(config: dict, put_params: dict, ic_params: dict) -> pd.Data
                 "margin_warning_days": warning_days,
                 "forced_exit_days": int(forced_exits["date"].nunique()) if not forced_exits.empty else 0,
                 "ic_entered_too_early": bool(name.startswith(("C_", "D_")) and len(ic_dates) > 0),
+                "entered_ai_supply_distortion": bool("macro_state" in equity and (equity["macro_state"] == "AI_SUPPLY_DISTORTION").any()),
+                "entered_bullwhip_collapse": bool("macro_state" in equity and (equity["macro_state"] == "BULLWHIP_COLLAPSE").any()),
+                "put_spread_opened": bool(not trades.empty and (trades["strategy"] == "put_spread").any()),
             }
         )
     rows.extend(run_delay_crash_tests(config, put_params, ic_params))
@@ -69,11 +75,13 @@ def run_delay_crash_tests(config: dict, put_params: dict, ic_params: dict) -> li
     rows = []
     for months in [6, 9, 12]:
         market, crash_date = synthetic_delay_crash_market(months)
+        macro = synthetic_macro_factors(market, "B_standard_black_swan")
         options = synthetic_options(market, config)
         portfolio = synthetic_portfolio(market, config)
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             market.to_csv(data_dir / "market.csv", index=False)
+            macro.to_csv(data_dir / "macro_factors.csv", index=False)
             options.to_csv(data_dir / "options.csv", index=False)
             portfolio.to_csv(data_dir / "portfolio.csv", index=False)
             equity, trades, _ = run_backtest(data_dir, config, put_params, ic_params, mode="full")
@@ -127,6 +135,14 @@ def synthetic_market(name: str) -> pd.DataFrame:
         price[crash_start + 19 :] = price[crash_start + 18]
         vix[crash_start : crash_start + 12] = np.linspace(16, 42, 12)
         vix[crash_start + 12 :] = np.linspace(42, 22, len(dates) - crash_start - 12)
+    elif name.startswith("G_"):
+        price[crash_start:] = np.linspace(price[crash_start - 1], price[crash_start - 1] * 1.05, len(dates) - crash_start)
+        vix[crash_start:] = np.linspace(16, 20, len(dates) - crash_start)
+    elif name.startswith("H_"):
+        price[crash_start : crash_start + 20] = np.linspace(price[crash_start - 1], price[crash_start - 1] * 0.82, 20)
+        price[crash_start + 20 :] = price[crash_start + 19]
+        vix[crash_start : crash_start + 20] = np.linspace(16, 45, 20)
+        vix[crash_start + 20 :] = np.linspace(45, 32, len(dates) - crash_start - 20)
     else:
         price[crash_start : crash_start + 15] = np.linspace(price[crash_start - 1], price[crash_start - 1] * 0.80, 15)
         price[crash_start + 15 :] = price[crash_start + 14]
@@ -145,6 +161,82 @@ def synthetic_market(name: str) -> pd.DataFrame:
         }
     )
     return out
+
+
+def synthetic_macro_factors(market: pd.DataFrame, name: str) -> pd.DataFrame:
+    dates = pd.to_datetime(market["date"])
+    n = len(dates)
+    crash_start = min(760, n - 120)
+    normal = pd.DataFrame(
+        {
+            "date": dates,
+            "hbm_asp_index": np.linspace(100, 120, n),
+            "ddr5_spot_index": np.linspace(100, 105, n),
+            "pc_shipments_yoy": 2.0,
+            "smartphone_shipments_yoy": 1.0,
+            "pc_sellthrough_yoy": 2.0,
+            "inventory_days_oem": 60.0,
+            "inventory_days_components": 60.0,
+            "pcb_revenue_yoy": 5.0,
+            "mlcc_revenue_yoy": 5.0,
+            "driver_ic_revenue_yoy": 5.0,
+            "unit_growth_yoy": 3.0,
+            "asp_growth_yoy": 4.0,
+            "ai_server_capex_yoy": 20.0,
+            "consumer_sentiment": 100.0,
+            "cpi_yoy": 2.5,
+            "core_cpi_yoy": 2.4,
+            "ppi_yoy": 3.0,
+            "real_wage_growth_yoy": 1.0,
+            "consumer_confidence": 100.0,
+            "unemployment_rate": 4.0,
+            "policy_rate": 2.5,
+            "us10y_yield": 3.0,
+            "credit_card_delinquency": 2.0,
+            "oil_price_yoy": 0.0,
+            "usd_index": 100.0,
+            "retail_sales_yoy": 3.5,
+            "sox_relative_strength": 5.0,
+            "tsmc_relative_strength": 5.0,
+            "memory_relative_strength": 5.0,
+            "pcb_relative_strength": 5.0,
+            "mlcc_relative_strength": 5.0,
+            "valuation_risk_index": 55.0,
+            "liquidity_stress_index": 35.0,
+            "event_flag": 0,
+        }
+    )
+    if name.startswith("G_"):
+        normal.loc[crash_start:, "hbm_asp_index"] = np.linspace(120, 180, n - crash_start)
+        normal.loc[crash_start:, "ddr5_spot_index"] = np.linspace(105, 168, n - crash_start)
+        component_path = np.linspace(20, 40, n - crash_start)
+        for col in ["pcb_revenue_yoy", "mlcc_revenue_yoy", "driver_ic_revenue_yoy"]:
+            normal.loc[crash_start:, col] = component_path
+        normal.loc[crash_start:, "unit_growth_yoy"] = 5.0
+        normal.loc[crash_start:, "asp_growth_yoy"] = np.linspace(15, 35, n - crash_start)
+        normal.loc[crash_start:, "inventory_days_components"] = np.linspace(70, 95, n - crash_start)
+        normal.loc[crash_start:, "pc_sellthrough_yoy"] = np.linspace(1, -2, n - crash_start)
+        normal.loc[crash_start:, "consumer_sentiment"] = np.linspace(95, 78, n - crash_start)
+        normal.loc[crash_start:, "valuation_risk_index"] = np.linspace(65, 80, n - crash_start)
+    if name.startswith("H_"):
+        normal.loc[:crash_start, "hbm_asp_index"] = np.linspace(100, 180, crash_start + 1)
+        normal.loc[:crash_start, "ddr5_spot_index"] = np.linspace(100, 160, crash_start + 1)
+        component_path = np.linspace(10, 40, crash_start + 1)
+        for col in ["pcb_revenue_yoy", "mlcc_revenue_yoy", "driver_ic_revenue_yoy"]:
+            normal.loc[:crash_start, col] = component_path
+        normal.loc[crash_start:, "pc_shipments_yoy"] = -15.0
+        normal.loc[crash_start:, "smartphone_shipments_yoy"] = -12.0
+        normal.loc[crash_start:, "pc_sellthrough_yoy"] = -18.0
+        normal.loc[crash_start:, "inventory_days_oem"] = np.linspace(90, 130, n - crash_start)
+        normal.loc[crash_start:, "inventory_days_components"] = np.linspace(100, 150, n - crash_start)
+        component_path = np.linspace(-5, -35, n - crash_start)
+        for col in ["pcb_revenue_yoy", "mlcc_revenue_yoy", "driver_ic_revenue_yoy"]:
+            normal.loc[crash_start:, col] = component_path
+        normal.loc[crash_start:, "ddr5_spot_index"] = np.linspace(160, 110, n - crash_start)
+        normal.loc[crash_start:, "consumer_sentiment"] = np.linspace(80, 55, n - crash_start)
+        normal.loc[crash_start:, "valuation_risk_index"] = 85.0
+        normal.loc[crash_start:, "liquidity_stress_index"] = np.linspace(75, 95, n - crash_start)
+    return normal
 
 
 def synthetic_delay_crash_market(months: int) -> tuple[pd.DataFrame, pd.Timestamp]:
@@ -179,25 +271,31 @@ def synthetic_delay_crash_market(months: int) -> tuple[pd.DataFrame, pd.Timestam
 
 def synthetic_options(market: pd.DataFrame, config: dict, wide_spread: bool = False) -> pd.DataFrame:
     rows = []
-    rate = float(config["risk_free_rate"])
     spread = 0.20 if wide_spread else 0.08
     start = pd.Timestamp(market["date"].min()) + pd.offsets.BDay(30)
     end = pd.Timestamp(market["date"].max()) + pd.offsets.BDay(130)
     expiry_calendar = pd.bdate_range(start, end, freq="20B")
-    global_low_strike = int(np.floor(float(market["txf_close"].min()) * 0.60 / 200) * 200)
-    global_high_strike = int(np.ceil(float(market["txf_close"].max()) * 1.40 / 200) * 200)
+    global_low_strike = int(np.floor(float(market["txf_close"].min()) * 0.60 / 500) * 500)
+    global_high_strike = int(np.ceil(float(market["txf_close"].max()) * 1.40 / 500) * 500)
     for row in market.itertuples(index=False):
         date = pd.Timestamp(row.date)
+        if (date - pd.Timestamp(market["date"].min())).days < 600:
+            continue
         expiries = [e for e in expiry_calendar if 20 <= np.busday_count(date.date(), pd.Timestamp(e).date()) <= 125][:3]
         for expiry in expiries:
             dte = int(np.busday_count(date.date(), pd.Timestamp(expiry).date()))
-            for strike in range(global_low_strike, global_high_strike + 200, 200):
+            time_scale = max(dte / 90.0, 0.05)
+            for strike in range(global_low_strike, global_high_strike + 500, 500):
                 for cp in ["P", "C"]:
                     iv = max(0.12, float(row.vix) / 100.0 * (1.1 if cp == "P" else 0.95))
-                    close = bs_price(float(row.txf_close), strike, dte, rate, iv, cp)
-                    if not np.isfinite(close) or close <= 0:
-                        continue
-                    delta = bs_delta(float(row.txf_close), strike, dte, rate, iv, cp)
+                    intrinsic = max(strike - float(row.txf_close), 0.0) if cp == "P" else max(float(row.txf_close) - strike, 0.0)
+                    distance = abs(strike / float(row.txf_close) - 1.0)
+                    close = intrinsic + max(2.0, float(row.txf_close) * iv * np.exp(-distance * 8.0) * 0.018 * time_scale)
+                    delta = (
+                        -max(0.01, min(0.95, 1.0 / (1.0 + np.exp((float(row.txf_close) - strike) / 900.0))))
+                        if cp == "P"
+                        else max(0.01, min(0.95, 1.0 / (1.0 + np.exp((strike - float(row.txf_close)) / 900.0))))
+                    )
                     rows.append(
                         {
                             "date": row.date,
