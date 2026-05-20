@@ -13,6 +13,7 @@ from src.data_pipeline import build_processed_data
 from src.data_validation import validate_data
 from src.pathing import ensure_data_layout, resolve_processed_data_dir, resolve_raw_data_dir, resolve_runtime_data_dir
 from src.reports import write_reports
+from src.report_auditor import run_report_audit
 from src.stress_tests import run_stress_suite
 from src.utils import ensure_dirs, load_config_module
 from src.walk_forward import run_walk_forward
@@ -21,7 +22,7 @@ from src.walk_forward import run_walk_forward
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TXO black-swan hedge and post-panic short-vol backtester")
     parser.add_argument("--config", default="config.py", help="Path to config.py")
-    parser.add_argument("--mode", default="full", choices=["put_spread_only", "iron_condor_only", "full", "stress", "walk_forward", "validate_data", "build_data"])
+    parser.add_argument("--mode", default="full", choices=["put_spread_only", "iron_condor_only", "full", "stress", "walk_forward", "validate_data", "build_data", "report_audit"])
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
     parser.add_argument("--raw-dir", default=None, help="Override raw input directory for build_data")
     parser.add_argument("--processed-dir", default=None, help="Override processed output directory")
@@ -61,6 +62,14 @@ def main() -> None:
         result = build_processed_data(raw_data_dir, processed_data_dir)
         print(f"Processed data written to {processed_data_dir}")
         print(result)
+        return
+
+    if args.mode == "report_audit":
+        audit = run_report_audit(root / "reports")
+        counts = audit["status"].value_counts().to_dict() if not audit.empty else {}
+        print(f"Report audit written to {root / 'reports' / 'report_audit.csv'}")
+        print(f"Report audit markdown written to {root / 'reports' / 'report_audit.md'}")
+        print(f"Status counts: {counts}")
         return
 
     if args.mode == "stress":
