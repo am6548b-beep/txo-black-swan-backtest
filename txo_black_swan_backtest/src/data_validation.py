@@ -21,7 +21,7 @@ def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFram
             required=["date", "expiry", "dte", "cp", "strike", "close"],
         )
     )
-    rows.extend(_validate_csv(data_dir / "portfolio.csv", PORTFOLIO_COLUMNS, required=[]))
+    rows.extend(_validate_csv(data_dir / "portfolio.csv", PORTFOLIO_COLUMNS, required=[], optional=True))
     rows.extend(_validate_csv(data_dir / "macro_factors.csv", MACRO_FACTOR_COLUMNS, required=["date"]))
 
     market = _read_csv(data_dir / "market.csv", ["date"])
@@ -68,9 +68,9 @@ def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFram
     return report
 
 
-def _validate_csv(path: Path, expected_columns: list[str], required: list[str]) -> list[dict]:
+def _validate_csv(path: Path, expected_columns: list[str], required: list[str], optional: bool = False) -> list[dict]:
     if not path.exists():
-        return [_check(path.name, "file_exists", "FAIL", "file missing")]
+        return [_check(path.name, "file_exists", "WARN" if optional else "FAIL", "optional file missing" if optional else "file missing")]
     try:
         df = pd.read_csv(path, nrows=5)
     except Exception as exc:

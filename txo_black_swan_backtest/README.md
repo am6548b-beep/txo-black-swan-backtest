@@ -60,6 +60,54 @@ python main.py --mode stress
 python main.py --mode walk_forward
 ```
 
+## 真實資料接入流程
+
+資料目錄：
+
+- `data/raw/`：放真實原始 CSV，不進 git。
+- `data/processed/`：pipeline 轉換後的標準格式，不進 git。
+- `data/sample/`：小型格式範例，可進 git。
+
+原始檔可使用下列檔名之一：
+
+- 台指期 / market：`data/raw/tx_futures.csv`、`taifex_futures.csv`、`futures.csv`、`market.csv`
+- 台指 VIX：`data/raw/tx_vix.csv`、`vix.csv`、`taifex_vix.csv`
+- 台指選擇權：`data/raw/txo_options.csv`、`options.csv`、`taifex_options.csv`
+- macro factors：`data/raw/macro_factors.csv`、`macro.csv`
+
+建立 processed data：
+
+```bash
+python main.py --mode build_data --config config.py
+```
+
+輸出：
+
+- `data/processed/market.csv`
+- `data/processed/options.csv`
+- `data/processed/macro_factors.csv`
+
+檢查 processed data：
+
+```bash
+python main.py --mode validate_data --config config.py
+```
+
+回測資料來源順序：
+
+1. 若 `data/processed/market.csv` 與 `data/processed/options.csv` 有有效資料，回測使用 `data/processed/`。
+2. 若 processed 尚未建立，回測 fallback 到 `data/sample/`。
+3. 可用 `--data-dir` 明確指定資料夾。
+
+範例：
+
+```bash
+python main.py --mode put_spread_only --config config.py --data-dir data/processed
+python main.py --mode put_spread_only --config config.py --data-dir data/sample
+```
+
+注意：pipeline 只負責欄位標準化，不會改策略規則，不會調參數，也不會把成交價改成 close。若原始選擇權缺少 bid/ask，後續 loader 仍會依保守估計 spread 補值，並在報告中保留資料品質風險。
+
 測試：
 
 ```bash
