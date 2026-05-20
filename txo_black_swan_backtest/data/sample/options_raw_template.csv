@@ -1,0 +1,2 @@
+date,expiry,dte,cp,strike,close,bid,ask,volume,open_interest,iv,delta
+2026-01-02,2026-03-20,77,P,18000,120,115,125,300,1200,0.22,-0.10

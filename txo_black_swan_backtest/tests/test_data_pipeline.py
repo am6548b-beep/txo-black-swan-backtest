@@ -40,12 +40,58 @@ def test_data_pipeline_builds_processed_csvs(tmp_path) -> None:
 
     result = build_processed_data(raw, processed)
 
+    assert result["status"] == "FOUND_RAW_DATA"
+    assert result["overwritten"] is False
     assert result["market_rows"] == 2
     assert result["options_rows"] == 1
     assert result["macro_rows"] == 1
     assert (processed / "market.csv").exists()
     assert (processed / "options.csv").exists()
     assert (processed / "macro_factors.csv").exists()
+
+
+def test_data_pipeline_does_not_overwrite_when_raw_empty(tmp_path) -> None:
+    raw = tmp_path / "raw"
+    processed = tmp_path / "processed"
+    raw.mkdir()
+    processed.mkdir()
+    (processed / "market.csv").write_text("date,tx_close\n2024-01-02,100\n", encoding="utf-8")
+    (processed / "options.csv").write_text("date,expiry,dte,cp,strike,close\n2024-01-02,2024-03-01,59,P,9000,10\n", encoding="utf-8")
+
+    result = build_processed_data(raw, processed)
+
+    assert result["status"] == "NO_RAW_DATA"
+    assert result["data_source_status"] == "USING_EXISTING_PROCESSED_DATA"
+    assert result["overwritten"] is False
+    assert result["real_data_backtest"] is False
+    assert "This is not a real-data backtest." in str(result["note"])
+    assert "2024-01-02" in (processed / "market.csv").read_text(encoding="utf-8")
+
+
+def test_data_pipeline_does_not_overwrite_existing_processed_without_flag(tmp_path) -> None:
+    raw = tmp_path / "raw"
+    processed = tmp_path / "processed"
+    raw.mkdir()
+    processed.mkdir()
+    (processed / "market.csv").write_text("date,tx_close\n2024-01-02,100\n", encoding="utf-8")
+    (processed / "options.csv").write_text("date,expiry,dte,cp,strike,close\n2024-01-02,2024-03-01,59,P,9000,10\n", encoding="utf-8")
+    pd.DataFrame(
+        {
+            "Date": ["2024-01-03"],
+            "Open": [101],
+            "High": [103],
+            "Low": [100],
+            "Close": [102],
+            "Volume": [1200],
+        }
+    ).to_csv(raw / "tx_futures.csv", index=False)
+
+    result = build_processed_data(raw, processed)
+
+    assert result["status"] == "FOUND_RAW_DATA"
+    assert result["data_source_status"] == "USING_EXISTING_PROCESSED_DATA"
+    assert result["overwritten"] is False
+    assert "2024-01-02" in (processed / "market.csv").read_text(encoding="utf-8")
 
 
 def test_taifex_loader_normalizes_call_put_aliases(tmp_path) -> None:

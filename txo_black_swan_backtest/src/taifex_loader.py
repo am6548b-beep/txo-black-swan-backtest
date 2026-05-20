@@ -97,6 +97,10 @@ def _first_existing(raw_dir: Path, names: list[str]) -> Path | None:
         path = raw_dir / name
         if path.exists():
             return path
+    for name in names:
+        matches = sorted(p for p in raw_dir.rglob(name) if p.is_file())
+        if matches:
+            return matches[0]
     return None
 
 

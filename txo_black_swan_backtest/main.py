@@ -22,10 +22,11 @@ from src.walk_forward import run_walk_forward
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TXO black-swan hedge and post-panic short-vol backtester")
     parser.add_argument("--config", default="config.py", help="Path to config.py")
-    parser.add_argument("--mode", default="full", choices=["put_spread_only", "iron_condor_only", "full", "stress", "walk_forward", "validate_data", "build_data", "report_audit"])
+    parser.add_argument("--mode", default="full", choices=["put_spread_only", "iron_condor_only", "full", "stress", "walk_forward", "validate_data", "build_data", "build_dataset", "report_audit"])
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
     parser.add_argument("--raw-dir", default=None, help="Override raw input directory for build_data")
     parser.add_argument("--processed-dir", default=None, help="Override processed output directory")
+    parser.add_argument("--overwrite", action="store_true", help="Allow build_dataset to overwrite existing processed CSV files")
     return parser.parse_args()
 
 
@@ -58,9 +59,10 @@ def main() -> None:
         print(f"Status counts: {status_counts}")
         return
 
-    if args.mode == "build_data":
-        result = build_processed_data(raw_data_dir, processed_data_dir)
-        print(f"Processed data written to {processed_data_dir}")
+    if args.mode in {"build_data", "build_dataset"}:
+        overwrite = bool(args.overwrite or config.get("allow_processed_overwrite", False))
+        result = build_processed_data(raw_data_dir, processed_data_dir, overwrite=overwrite, sample_dir=root / "data" / "sample")
+        print(f"Processed data dir: {processed_data_dir}")
         print(result)
         return
 

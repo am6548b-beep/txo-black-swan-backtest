@@ -8,7 +8,7 @@ import pandas as pd
 
 
 def ensure_data_layout(root: Path) -> None:
-    for rel in ["data/raw", "data/processed", "data/sample"]:
+    for rel in ["data/raw", "data/raw/taifex", "data/raw/macro", "data/processed", "data/sample"]:
         (root / rel).mkdir(parents=True, exist_ok=True)
 
 

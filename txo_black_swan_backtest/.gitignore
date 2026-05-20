@@ -31,6 +31,12 @@ reports/*.svg
 
 # Data files
 data/*
+!data/raw/
+data/raw/*
+!data/raw/taifex/
+!data/raw/macro/
+!data/raw/taifex/README.md
+!data/raw/macro/README.md
 !data/sample/
 !data/sample/*.csv
 

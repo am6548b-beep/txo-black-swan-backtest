@@ -206,3 +206,53 @@ AI 高獲利資源虹吸導致 HBM 產能優先、傳統 DRAM 供給被擠壓，
 - 真實保證金規則。
 - skew-aware delta / IV surface。
 - 可預知事件日資料來源與資料版本控管。
+## Raw Data Ingestion Guide
+
+Raw data should be placed under:
+
+- `data/raw/taifex/` for TAIFEX futures, options, and VIX CSV files.
+- `data/raw/macro/` for macro factor CSV files.
+
+Sample raw templates are tracked under:
+
+- `data/sample/market_raw_template.csv`
+- `data/sample/options_raw_template.csv`
+- `data/sample/macro_factors_raw_template.csv`
+
+Raw and processed data are intentionally ignored by git. The sample templates and raw directory README files are allowed in git.
+
+Accepted TAIFEX raw filenames include:
+
+- `tx_futures.csv`, `taifex_futures.csv`, `futures.csv`, or `market.csv`
+- `tx_vix.csv`, `vix.csv`, or `taifex_vix.csv`
+- `txo_options.csv`, `options.csv`, or `taifex_options.csv`
+
+Accepted macro raw filenames include:
+
+- `macro_factors.csv`
+- `macro.csv`
+
+Required market fields are `date` and `tx_close`. Required option fields are `date`, `expiry`, `cp`, `strike`, and `close`. Required macro field is `date`.
+
+Optional but important option fields are `bid`, `ask`, `iv`, and `delta`. If `bid` or `ask` are missing, downstream loading estimates bid/ask from `close` and marks `bid_ask_estimated=True`. If `iv` is missing, IV inversion is attempted and successful estimates are marked `iv_estimated=True`. If `delta` is missing, Black-Scholes delta is estimated and marked `delta_estimated=True`.
+
+Build processed data with:
+
+```bash
+python main.py --mode build_dataset --config config.py
+```
+
+By default, `build_dataset` does not overwrite existing `data/processed/*.csv`. To rebuild processed files from raw data:
+
+```bash
+python main.py --mode build_dataset --config config.py --overwrite
+```
+
+The build output explicitly reports these states when applicable:
+
+- `FOUND_RAW_DATA`
+- `NO_RAW_DATA`
+- `USING_SAMPLE_DATA`
+- `USING_EXISTING_PROCESSED_DATA`
+
+If the output status is `NO_RAW_DATA`, treat the result as: `This is not a real-data backtest.`
