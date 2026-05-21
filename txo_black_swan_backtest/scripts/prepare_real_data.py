@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -86,11 +87,12 @@ def main() -> None:
     options = load_official_options(raw_dir / "taifex" / "opt")
 
     market.to_csv(out_dir / "market.csv", index=False)
-    options.to_csv(out_dir / "options.csv", index=False)
+    options[[col for col in OPTION_COLUMNS if col in options.columns]].to_csv(out_dir / "options.csv", index=False)
 
     audit = build_audit(market, options, txf_market, official_market)
     audit_df = pd.DataFrame([item.__dict__ for item in audit])
     audit_df.to_csv(report_dir / "data_cleaning_audit.csv", index=False)
+    debug_counts = write_debug_outputs(report_dir, options)
     write_audit_markdown(report_dir / "data_cleaning_audit.md", audit_df, market, options)
 
     counts = audit_df["status"].value_counts().to_dict() if not audit_df.empty else {}
@@ -101,6 +103,9 @@ def main() -> None:
     print(f"wrote {out_dir / 'options.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.md'}")
+    print(f"bad expiry rows: {debug_counts['bad_expiry_rows']}")
+    print(f"bad bid/ask rows: {debug_counts['bad_bid_ask_rows']}")
+    print(f"extreme spread sample rows: {debug_counts['extreme_spread_rows_sample']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,6 +221,7 @@ def load_official_options(opt_dir: Path) -> pd.DataFrame:
         out["date"] = parse_date(txo[date_col])
         out["contract"] = col_or_nan(txo, ["契約"]).astype(str).str.strip()
         expiry_raw = col_or_nan(txo, ["到期月份(週別)", "到期月份"]).astype(str).str.strip()
+        out["expiry_raw"] = expiry_raw
         expiry_lookup = {raw: parse_taifex_expiry(raw) for raw in expiry_raw.dropna().unique()}
         out["expiry"] = expiry_raw.map(expiry_lookup)
         out["dte"] = (pd.to_datetime(out["expiry"]) - pd.to_datetime(out["date"])).dt.days
@@ -240,8 +246,8 @@ def load_official_options(opt_dir: Path) -> pd.DataFrame:
         out["bid_ask_estimated"] = False
         out["data_source"] = "taifex_official_daily"
         out["source_file"] = path.name
-        frames.append(out[OPTION_COLUMNS])
-    return concat_or_empty(frames, OPTION_COLUMNS).reset_index(drop=True)
+        frames.append(out[OPTION_COLUMNS + ["expiry_raw"]])
+    return concat_or_empty(frames, OPTION_COLUMNS + ["expiry_raw"]).reset_index(drop=True)
 
 
 def build_audit(market: pd.DataFrame, options: pd.DataFrame, txf_market: pd.DataFrame, official_market: pd.DataFrame) -> list[AuditItem]:
@@ -397,21 +403,17 @@ def expiry_sort_key(values: pd.Series) -> pd.Series:
 
 def parse_taifex_expiry(value: object) -> pd.Timestamp | pd.NaT:
     text = str(value).strip().upper()
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) < 6:
+    match = re.fullmatch(r"(\d{4})(\d{2})(?:([WF])([1-5]))?", text)
+    if match is None:
         return pd.NaT
-    year = int(digits[:4])
-    month = int(digits[4:6])
+    year = int(match.group(1))
+    month = int(match.group(2))
     if month < 1 or month > 12:
         return pd.NaT
-    week = None
-    if "W" in text:
-        try:
-            week = int(text.split("W", 1)[1][:1])
-        except ValueError:
-            week = None
-    nth = week if week else 3
-    day = nth_weekday(year, month, calendar.WEDNESDAY, nth)
+    marker = match.group(3)
+    nth = int(match.group(4)) if match.group(4) else 3
+    weekday = calendar.FRIDAY if marker == "F" else calendar.WEDNESDAY
+    day = nth_weekday(year, month, weekday, nth)
     return pd.Timestamp(year=year, month=month, day=day) if day is not None else pd.NaT
 
 
@@ -436,6 +438,74 @@ def spread_pct(df: pd.DataFrame) -> pd.Series:
     return (df["ask"] - df["bid"]) / mid.replace(0, np.nan)
 
 
+def write_debug_outputs(report_dir: Path, options: pd.DataFrame) -> dict[str, int]:
+    bad_expiry = bad_expiry_rows(options)
+    bad_bid_ask = bad_bid_ask_rows(options)
+    extreme_spread = extreme_spread_rows(options)
+
+    bad_expiry_cols = ["date", "contract", "expiry_raw", "expiry", "dte", "cp", "strike", "source_file"]
+    bad_bid_ask_cols = [
+        "date",
+        "contract",
+        "expiry_raw",
+        "expiry",
+        "dte",
+        "cp",
+        "strike",
+        "bid",
+        "ask",
+        "close",
+        "settlement_price",
+        "volume",
+        "open_interest",
+        "session",
+        "halt_flag",
+        "source_file",
+    ]
+    extreme_cols = bad_bid_ask_cols[:-1] + ["spread_pct", "source_file"]
+
+    bad_expiry[existing_cols(bad_expiry, bad_expiry_cols)].to_csv(report_dir / "bad_expiry_rows.csv", index=False)
+    bad_bid_ask[existing_cols(bad_bid_ask, bad_bid_ask_cols)].to_csv(report_dir / "bad_bid_ask_rows.csv", index=False)
+    extreme_spread.head(5000)[existing_cols(extreme_spread, extreme_cols)].to_csv(report_dir / "extreme_spread_rows_sample.csv", index=False)
+    return {
+        "bad_expiry_rows": int(len(bad_expiry)),
+        "bad_bid_ask_rows": int(len(bad_bid_ask)),
+        "extreme_spread_rows_sample": int(min(len(extreme_spread), 5000)),
+    }
+
+
+def bad_expiry_rows(options: pd.DataFrame) -> pd.DataFrame:
+    if options.empty:
+        return pd.DataFrame(columns=OPTION_COLUMNS + ["expiry_raw"])
+    date = pd.to_datetime(options["date"], errors="coerce")
+    expiry = pd.to_datetime(options["expiry"], errors="coerce")
+    mask = ((expiry.notna()) & (date.notna()) & (expiry < date)) | (options["dte"].notna() & (options["dte"] < 0))
+    return options.loc[mask].copy()
+
+
+def bad_bid_ask_rows(options: pd.DataFrame) -> pd.DataFrame:
+    if options.empty:
+        return pd.DataFrame(columns=OPTION_COLUMNS + ["expiry_raw"])
+    mask = options["bid"].notna() & options["ask"].notna() & (options["bid"] > options["ask"])
+    return options.loc[mask].copy()
+
+
+def extreme_spread_rows(options: pd.DataFrame) -> pd.DataFrame:
+    if options.empty:
+        out = pd.DataFrame(columns=OPTION_COLUMNS + ["expiry_raw", "spread_pct"])
+        return out
+    out = options.copy()
+    out["spread_pct"] = spread_pct(out)
+    return out.loc[out["spread_pct"] > 1.0].copy()
+
+
+def existing_cols(df: pd.DataFrame, columns: list[str]) -> list[str]:
+    for col in columns:
+        if col not in df.columns:
+            df[col] = np.nan
+    return columns
+
+
 def date_range_detail(df: pd.DataFrame) -> str:
     if "date" not in df or df.empty:
         return "no dates"
@@ -454,6 +524,7 @@ def distribution(df: pd.DataFrame, column: str) -> str:
 
 def write_audit_markdown(path: Path, audit: pd.DataFrame, market: pd.DataFrame, options: pd.DataFrame) -> None:
     counts = audit["status"].value_counts().to_dict() if not audit.empty else {}
+    diagnostics = build_debug_summary(options)
     lines = [
         "# Data Cleaning Audit",
         "",
@@ -479,6 +550,24 @@ def write_audit_markdown(path: Path, audit: pd.DataFrame, market: pd.DataFrame, 
     lines.extend(
         [
             "",
+            "## Debug Diagnostics",
+            "",
+            f"- bad expiry count: {diagnostics['bad_expiry_count']}",
+            f"- bad expiry first 20 expiry_raw examples: {diagnostics['bad_expiry_examples']}",
+            f"- bad expiry by expiry_raw pattern: {diagnostics['bad_expiry_by_pattern']}",
+            f"- bad expiry by year: {diagnostics['bad_expiry_by_year']}",
+            f"- bad expiry by source_file: {diagnostics['bad_expiry_by_source_file']}",
+            f"- bad bid/ask by source_file: {diagnostics['bad_bid_ask_by_source_file']}",
+            f"- bad bid/ask by session: {diagnostics['bad_bid_ask_by_session']}",
+            f"- extreme spread by DTE bucket: {diagnostics['extreme_spread_by_dte_bucket']}",
+            f"- extreme spread by volume bucket: {diagnostics['extreme_spread_by_volume_bucket']}",
+            f"- ask = 0 count: {diagnostics['ask_zero_count']}",
+            f"- bid = 0 count: {diagnostics['bid_zero_count']}",
+        ]
+    )
+    lines.extend(
+        [
+            "",
             "## Limitations",
             "",
             "- VIX remains blank unless supplied elsewhere.",
@@ -488,6 +577,66 @@ def write_audit_markdown(path: Path, audit: pd.DataFrame, market: pd.DataFrame, 
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_debug_summary(options: pd.DataFrame) -> dict[str, str | int]:
+    bad_expiry = bad_expiry_rows(options)
+    bad_bid_ask = bad_bid_ask_rows(options)
+    extreme = extreme_spread_rows(options)
+    if not extreme.empty:
+        dte_bucket = pd.cut(
+            extreme["dte"],
+            bins=[-np.inf, 0, 7, 14, 30, 60, 120, np.inf],
+            labels=["<0", "0-7", "8-14", "15-30", "31-60", "61-120", ">120"],
+        )
+        volume_bucket = pd.cut(
+            extreme["volume"].fillna(-1),
+            bins=[-np.inf, 0, 10, 50, 100, 500, np.inf],
+            labels=["missing_or_0", "1-10", "11-50", "51-100", "101-500", ">500"],
+        )
+        dte_detail = value_counts_detail(dte_bucket)
+        volume_detail = value_counts_detail(volume_bucket)
+    else:
+        dte_detail = "none"
+        volume_detail = "none"
+    examples = (
+        bad_expiry["expiry_raw"].dropna().astype(str).drop_duplicates().head(20).tolist()
+        if "expiry_raw" in bad_expiry
+        else []
+    )
+    return {
+        "bad_expiry_count": int(len(bad_expiry)),
+        "bad_expiry_examples": "; ".join(examples) if examples else "none",
+        "bad_expiry_by_pattern": value_counts_detail(bad_expiry["expiry_raw"].map(expiry_raw_pattern)) if "expiry_raw" in bad_expiry else "none",
+        "bad_expiry_by_year": value_counts_detail(pd.to_datetime(bad_expiry["date"], errors="coerce").dt.year) if "date" in bad_expiry else "none",
+        "bad_expiry_by_source_file": value_counts_detail(bad_expiry["source_file"]) if "source_file" in bad_expiry else "none",
+        "bad_bid_ask_by_source_file": value_counts_detail(bad_bid_ask["source_file"]) if "source_file" in bad_bid_ask else "none",
+        "bad_bid_ask_by_session": value_counts_detail(bad_bid_ask["session"]) if "session" in bad_bid_ask else "none",
+        "extreme_spread_by_dte_bucket": dte_detail,
+        "extreme_spread_by_volume_bucket": volume_detail,
+        "ask_zero_count": int((options["ask"].fillna(np.nan) == 0).sum()) if "ask" in options else 0,
+        "bid_zero_count": int((options["bid"].fillna(np.nan) == 0).sum()) if "bid" in options else 0,
+    }
+
+
+def value_counts_detail(values: pd.Series) -> str:
+    counts = values.astype(str).value_counts(dropna=False).head(20)
+    if counts.empty:
+        return "none"
+    return "; ".join(f"{idx}={val}" for idx, val in counts.items())
+
+
+def expiry_raw_pattern(value: object) -> str:
+    text = str(value).strip().upper()
+    if re.fullmatch(r"\d{6}", text):
+        return "YYYYMM monthly"
+    if re.fullmatch(r"\d{6}W[1-5]", text):
+        return "YYYYMMWn weekly_wed"
+    if re.fullmatch(r"\d{6}F[1-5]", text):
+        return "YYYYMMFn weekly_fri"
+    if re.fullmatch(r"\d{6}[A-Z]\d+", text):
+        return "YYYYMM other_weekly_marker"
+    return "unrecognized"
 
 
 if __name__ == "__main__":
