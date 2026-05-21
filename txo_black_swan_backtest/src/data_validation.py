@@ -45,6 +45,11 @@ def validate_data(data_dir: Path, report_dir: Path, config: dict) -> pd.DataFram
         rows.append(_check("options.csv", "iv_available", "PASS" if iv_ok else "WARN", "iv present" if iv_ok else "missing iv requires inversion; failures are untradable"))
         rows.append(_check("options.csv", "delta_available", "PASS" if delta_ok else "WARN", "delta present" if delta_ok else "missing delta uses Black-Scholes approximation"))
         rows.append(_check("options.csv", "liquidity_columns", "PASS" if {"volume", "open_interest"} <= set(options.columns) else "FAIL", "volume/open_interest required for liquidity gating"))
+        quote_cols = {"quote_quality_status", "spread_pct", "is_tradable_quote"}
+        rows.append(_check("options.csv", "quote_quality_columns", "PASS" if quote_cols <= set(options.columns) else "WARN", "quote quality columns present" if quote_cols <= set(options.columns) else f"missing={sorted(quote_cols - set(options.columns))}; legacy liquidity checks remain active"))
+        if "is_tradable_quote" in options:
+            tradable_quote = options["is_tradable_quote"].astype(str).str.lower().isin({"true", "1", "yes", "y"})
+            rows.append(_check("options.csv", "tradable_quote_rows", "PASS" if tradable_quote.any() else "WARN", f"tradable_quote_rows={int(tradable_quote.sum())}"))
         if {"volume", "open_interest"} <= set(options.columns):
             liquid = (
                 (options["volume"] >= float(config.get("wide_spread_volume_threshold", 50)))

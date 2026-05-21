@@ -36,6 +36,9 @@ def row_to_contract(row) -> OptionContract:
         bid_ask_estimated=bool(getattr(row, "bid_ask_estimated", False)),
         iv_estimated=bool(getattr(row, "iv_estimated", False)),
         delta_estimated=bool(getattr(row, "delta_estimated", False)),
+        quote_quality_status=str(getattr(row, "quote_quality_status", "UNKNOWN")),
+        spread_pct=None if not hasattr(row, "spread_pct") or pd.isna(getattr(row, "spread_pct")) else float(getattr(row, "spread_pct")),
+        is_tradable_quote=bool(getattr(row, "is_tradable_quote", True)),
     )
 
 
@@ -154,6 +157,7 @@ class BlackSwanStateMachine:
         self.positions: list[Position] = []
         self.trades: list[Trade] = []
         self.states = []
+        self.lifecycle_events: list[dict[str, str]] = []
         self.annual_hedge_spend: dict[int, float] = {}
         self.realized_hedge_profit = 0.0
         self.position_counter = itertools.count(1)
@@ -164,6 +168,7 @@ class BlackSwanStateMachine:
         prev_option_value = None
         for row in self.market.itertuples(index=False):
             date = pd.Timestamp(row.date)
+            expiry_warning = self._expire_past_due_positions(date)
             stock_row = self.portfolio[self.portfolio["date"] == date]
             stock_equity = (
                 float(stock_row.iloc[0]["stock_equity"])
@@ -174,6 +179,8 @@ class BlackSwanStateMachine:
             option_value = self._option_liquidation_value(row)
             required_margin = self._required_margin()
             warning = self._risk_update(row, required_margin, option_value, stock_equity)
+            if expiry_warning:
+                warning = ";".join(filter(None, [warning, expiry_warning]))
             self._check_exits(row)
             if self.mode in {"full", "put_spread_only"}:
                 self._check_put_entry(row, stock_equity)
@@ -199,7 +206,9 @@ class BlackSwanStateMachine:
             self.states.append(asdict(state))
             prev_stock = stock_equity
             prev_option_value = option_value
-        return pd.DataFrame(self.states), pd.DataFrame([asdict(t) for t in self.trades])
+        equity = pd.DataFrame(self.states)
+        equity.attrs["position_lifecycle_events"] = self.lifecycle_events
+        return equity, pd.DataFrame([asdict(t) for t in self.trades])
 
     def _open_positions(self, strategy: str | None = None) -> list[Position]:
         out = [p for p in self.positions if not p.closed]
@@ -217,10 +226,42 @@ class BlackSwanStateMachine:
                     refreshed.append(leg)
             pos.legs = refreshed
 
+    def _position_expiry(self, pos: Position) -> pd.Timestamp:
+        expiries = [pd.Timestamp(leg.expiry) for leg in pos.legs]
+        return min(expiries)
+
+    def _position_has_current_quotes(self, pos: Position, date: pd.Timestamp) -> bool:
+        current = str(date.date())
+        return all(leg.contract.date == current for leg in pos.legs)
+
+    def _expire_past_due_positions(self, date: pd.Timestamp) -> str:
+        expired_ids: list[str] = []
+        for pos in self._open_positions():
+            if date > self._position_expiry(pos):
+                pos.closed = True
+                pos.close_date = str(date.date())
+                pos.notes["lifecycle_status"] = "forced_unfilled_exit"
+                pos.notes["issue"] = "expired_position_error"
+                pos.quantity = 0
+                self.lifecycle_events.append(
+                    {
+                        "position_id": pos.id,
+                        "entry_date": pos.entry_date,
+                        "expiry": str(self._position_expiry(pos).date()),
+                        "exit_date": str(date.date()),
+                        "status": "WARN",
+                        "issue": "forced_unfilled_exit",
+                    }
+                )
+                expired_ids.append(pos.id)
+        return f"expired_position_error={','.join(expired_ids)}" if expired_ids else ""
+
     def _option_liquidation_value(self, market_row) -> float:
         stress = is_stress_day(market_row, self.config)
         value = 0.0
         for pos in self._open_positions():
+            if not self._position_has_current_quotes(pos, pd.Timestamp(market_row.date)):
+                continue
             for leg in pos.legs:
                 side = "SELL" if leg.quantity > 0 else "BUY"
                 price = fill_price(leg.contract, side, self.config, stress)
@@ -323,6 +364,8 @@ class BlackSwanStateMachine:
             self.state = StrategyState.POST_PANIC
 
     def _put_spread_value_per_spread(self, pos: Position, row) -> float:
+        if not self._position_has_current_quotes(pos, pd.Timestamp(row.date)):
+            return 0.0
         stress = is_stress_day(row, self.config)
         total = 0.0
         qty = max(1, abs(pos.quantity))
@@ -335,6 +378,12 @@ class BlackSwanStateMachine:
 
     def _check_put_exit(self, row, pos: Position) -> None:
         if pos.closed:
+            return
+        date_ts = pd.Timestamp(row.date)
+        if date_ts > self._position_expiry(pos):
+            self._expire_past_due_positions(date_ts)
+            return
+        if not self._position_has_current_quotes(pos, date_ts):
             return
         long_leg = next(l for l in pos.legs if l.quantity > 0)
         short_leg = next(l for l in pos.legs if l.quantity < 0)
@@ -454,6 +503,12 @@ class BlackSwanStateMachine:
     def _check_ic_exit(self, row, pos: Position) -> None:
         if pos.closed:
             return
+        date_ts = pd.Timestamp(row.date)
+        if date_ts > self._position_expiry(pos):
+            self._expire_past_due_positions(date_ts)
+            return
+        if not self._position_has_current_quotes(pos, date_ts):
+            return
         liquidation = -self._position_liquidation_value(pos, row)
         credit = max(pos.credit_received, 1.0)
         pnl = pos.credit_received - liquidation
@@ -483,6 +538,8 @@ class BlackSwanStateMachine:
             self._close_position_qty(row, pos, qty, reason)
 
     def _position_liquidation_value(self, pos: Position, row) -> float:
+        if not self._position_has_current_quotes(pos, pd.Timestamp(row.date)):
+            return 0.0
         stress = is_stress_day(row, self.config)
         value = 0.0
         for leg in pos.legs:
@@ -495,6 +552,11 @@ class BlackSwanStateMachine:
     def _close_position_qty(self, row, pos: Position, qty_to_close: int, reason: str) -> None:
         stress = is_stress_day(row, self.config)
         date = str(pd.Timestamp(row.date).date())
+        if pd.Timestamp(date) > self._position_expiry(pos):
+            self._expire_past_due_positions(pd.Timestamp(date))
+            return
+        if not self._position_has_current_quotes(pos, pd.Timestamp(date)):
+            return
         cash_before = self.cash
         open_qty_before = max(1, abs(pos.quantity))
         for leg in pos.legs:

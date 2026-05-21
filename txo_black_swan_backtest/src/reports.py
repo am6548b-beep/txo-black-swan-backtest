@@ -23,6 +23,7 @@ TRADE_COLUMNS = [
     "cash_flow",
     "cost",
     "reason",
+    "dte_at_trade",
     "underlying_price_at_trade",
     "txf_close_at_trade",
     "option_bid_at_trade",
@@ -35,6 +36,9 @@ TRADE_COLUMNS = [
     "bid_ask_estimated",
     "iv_estimated",
     "delta_estimated",
+    "quote_quality_status",
+    "spread_pct",
+    "is_tradable_quote",
 ]
 EQUITY_COLUMNS = [
     "date",
@@ -72,6 +76,8 @@ def write_reports(
     pd.DataFrame([summarize(equity, trades, label)]).to_csv(report_dir / "summary.csv", index=False)
     (trades if not trades.empty else pd.DataFrame(columns=TRADE_COLUMNS)).to_csv(report_dir / "trades.csv", index=False)
     (equity if not equity.empty else pd.DataFrame(columns=EQUITY_COLUMNS)).to_csv(report_dir / "equity_curve.csv", index=False)
+    lifecycle_events = equity.attrs.get("position_lifecycle_events", []) if hasattr(equity, "attrs") else []
+    pd.DataFrame(lifecycle_events).to_csv(report_dir / "position_lifecycle_events.csv", index=False)
     regime_report(equity, regimes).to_csv(report_dir / "regime_report.csv", index=False)
     if stress is not None:
         stress.to_csv(report_dir / "stress_report.csv", index=False)

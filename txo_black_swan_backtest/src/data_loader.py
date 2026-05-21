@@ -36,6 +36,9 @@ OPTION_COLUMNS = [
     "open_interest",
     "iv",
     "delta",
+    "quote_quality_status",
+    "spread_pct",
+    "is_tradable_quote",
 ]
 
 PORTFOLIO_COLUMNS = ["date", "stock_equity", "portfolio_beta"]
@@ -159,52 +162,93 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
         options["iv"] = np.nan
     if "delta" not in options.columns:
         options["delta"] = np.nan
+    quote_quality_available = "is_tradable_quote" in options.columns
+    if "quote_quality_status" not in options.columns:
+        options["quote_quality_status"] = "UNKNOWN"
+    if "spread_pct" not in options.columns:
+        options["spread_pct"] = np.nan
+    if "is_tradable_quote" not in options.columns:
+        options["is_tradable_quote"] = True
+    options["is_tradable_quote"] = _bool_series(options["is_tradable_quote"]).fillna(False if quote_quality_available else True)
 
     underlying = market[["date", "txf_close"]].rename(columns={"txf_close": "underlying"})
     options = options.merge(underlying, on="date", how="left")
     rate = float(config.get("risk_free_rate", 0.015))
 
-    iv_values: list[float | None] = []
-    delta_values: list[float | None] = []
-    iv_estimated_values: list[bool] = []
-    delta_estimated_values: list[bool] = []
-    tradable: list[bool] = []
-    reasons: list[str] = []
-    for row in options.itertuples(index=False):
-        iv_input_valid = valid_number(row.iv) and float(row.iv) > 0
-        iv = float(row.iv) if iv_input_valid else None
-        iv_estimated = False
-        if iv is None and valid_number(row.underlying):
-            iv = implied_vol(
-                float(row.close),
-                float(row.underlying),
-                float(row.strike),
-                float(row.dte),
-                rate,
-                row.cp,
-            )
-            iv_estimated = iv is not None
-        delta_input_valid = valid_number(row.delta)
-        delta = float(row.delta) if delta_input_valid else None
-        delta_estimated = False
-        if delta is None and iv is not None and valid_number(row.underlying):
-            delta = bs_delta(
-                float(row.underlying),
-                float(row.strike),
-                float(row.dte),
-                rate,
-                iv,
-                row.cp,
-            )
-            delta_estimated = delta == delta
-        is_tradable = iv is not None and delta is not None and float(row.ask) >= float(row.bid) >= 0
-        reason = "" if is_tradable else "missing_iv_or_delta"
-        iv_values.append(iv)
-        delta_values.append(delta)
-        iv_estimated_values.append(iv_estimated)
-        delta_estimated_values.append(delta_estimated)
-        tradable.append(is_tradable)
-        reasons.append(reason)
+    min_volume = float(config.get("wide_spread_volume_threshold", 50))
+    min_oi = float(config.get("min_open_interest", 100))
+    max_pricing_dte = float(config.get("max_option_pricing_dte", 180))
+    needs_greeks = config.get("runtime_mode") != "put_spread_only"
+    iv_values: list[float | None] = [None if not valid_number(v) else float(v) for v in options["iv"]]
+    delta_values: list[float | None] = [None if not valid_number(v) else float(v) for v in options["delta"]]
+    iv_estimated_values: list[bool] = [False] * len(options)
+    delta_estimated_values: list[bool] = [False] * len(options)
+    tradable: list[bool] = [False] * len(options)
+    reasons: list[str] = [""] * len(options)
+
+    basic_mask = (
+        options["is_tradable_quote"].astype(bool)
+        & options["underlying"].notna()
+        & options["dte"].notna()
+        & options["bid"].notna()
+        & options["ask"].notna()
+        & (options["dte"] >= 0)
+        & (options["dte"] <= max_pricing_dte)
+        & (options["ask"] >= options["bid"])
+        & (options["bid"] >= 0)
+        & (options["volume"] >= min_volume)
+        & (options["open_interest"] >= min_oi)
+    )
+    reasons = np.where(~options["is_tradable_quote"].astype(bool), "non_tradable_quote", reasons).tolist()
+    reasons = np.where((options["volume"] < min_volume) | (options["open_interest"] < min_oi), "insufficient_liquidity", reasons).tolist()
+    reasons = np.where((options["dte"].isna()) | (options["dte"] < 0) | (options["dte"] > max_pricing_dte), "invalid_dte", reasons).tolist()
+    reasons = np.where((options["bid"].isna()) | (options["ask"].isna()) | (options["ask"] < options["bid"]) | (options["bid"] < 0), "invalid_quote", reasons).tolist()
+
+    if not needs_greeks:
+        tradable = basic_mask.tolist()
+        reasons = np.where(basic_mask, "", reasons).tolist()
+    else:
+        for row in options.loc[basic_mask].itertuples():
+            quote_ok = True
+            iv_input_valid = valid_number(row.iv) and float(row.iv) > 0
+            iv = float(row.iv) if iv_input_valid else None
+            iv_estimated = False
+            if iv is None and valid_number(row.underlying):
+                iv = implied_vol(
+                    float(row.close),
+                    float(row.underlying),
+                    float(row.strike),
+                    float(row.dte),
+                    rate,
+                    row.cp,
+                )
+                iv_estimated = iv is not None
+            delta_input_valid = valid_number(row.delta)
+            delta = float(row.delta) if delta_input_valid else None
+            delta_estimated = False
+            if delta is None and iv is not None and valid_number(row.underlying):
+                delta = bs_delta(
+                    float(row.underlying),
+                    float(row.strike),
+                    float(row.dte),
+                    rate,
+                    iv,
+                    row.cp,
+                )
+                delta_estimated = delta == delta
+            is_tradable = iv is not None and delta is not None and float(row.ask) >= float(row.bid) >= 0 and quote_ok
+            if is_tradable:
+                reason = ""
+            elif not quote_ok:
+                reason = "non_tradable_quote"
+            else:
+                reason = "missing_iv_or_delta"
+            iv_values[row.Index] = iv
+            delta_values[row.Index] = delta
+            iv_estimated_values[row.Index] = iv_estimated
+            delta_estimated_values[row.Index] = delta_estimated
+            tradable[row.Index] = is_tradable
+            reasons[row.Index] = reason
     options["iv"] = iv_values
     options["delta"] = delta_values
     options["tradable"] = tradable
@@ -212,6 +256,14 @@ def load_options(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataF
     options["iv_estimated"] = iv_estimated_values
     options["delta_estimated"] = delta_estimated_values
     return options.sort_values(["date", "expiry", "cp", "strike"]).reset_index(drop=True)
+
+
+def _bool_series(series: pd.Series) -> pd.Series:
+    if series.dtype == bool:
+        return series
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).astype(float) != 0
+    return series.astype(str).str.lower().isin({"true", "1", "yes", "y"})
 
 
 def load_portfolio(data_dir: Path, market: pd.DataFrame, config: dict) -> pd.DataFrame:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.contracts import OptionContract
 from src.execution import fill_price, trade_contract
+import pytest
 
 
 def _contract() -> OptionContract:
@@ -48,6 +49,7 @@ def test_costs_are_deducted() -> None:
     expected_cost = 30 * 2 + gross * 0.001
     assert fill.cash_flow == -(gross + expected_cost)
     assert trade.cost == expected_cost
+    assert trade.dte_at_trade == 30
 
 
 def test_stress_slippage_is_larger() -> None:
@@ -55,3 +57,19 @@ def test_stress_slippage_is_larger() -> None:
     cfg = _config()
     assert fill_price(c, "BUY", cfg, stress=True) > fill_price(c, "BUY", cfg, stress=False)
 
+
+def test_expired_option_cannot_be_traded() -> None:
+    c = _contract()
+    cfg = _config()
+
+    with pytest.raises(ValueError, match="expired option"):
+        trade_contract("2024-02-02", "P1", "put_spread", c, "BUY", 1, cfg, "test")
+
+
+def test_trade_dte_at_trade_calculation() -> None:
+    c = _contract()
+    cfg = _config()
+
+    _, trade = trade_contract("2024-01-20", "P1", "put_spread", c, "SELL", 1, cfg, "test")
+
+    assert trade.dte_at_trade == 12

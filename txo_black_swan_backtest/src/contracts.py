@@ -42,6 +42,9 @@ class OptionContract:
     bid_ask_estimated: bool = False
     iv_estimated: bool = False
     delta_estimated: bool = False
+    quote_quality_status: str = "UNKNOWN"
+    spread_pct: float | None = None
+    is_tradable_quote: bool = True
 
 
 @dataclass
@@ -100,6 +103,7 @@ class Trade:
     cash_flow: float
     cost: float
     reason: str
+    dte_at_trade: int | None = None
     underlying_price_at_trade: float | None = None
     txf_close_at_trade: float | None = None
     option_bid_at_trade: float | None = None
@@ -112,6 +116,9 @@ class Trade:
     bid_ask_estimated: bool = False
     iv_estimated: bool = False
     delta_estimated: bool = False
+    quote_quality_status: str = "UNKNOWN"
+    spread_pct: float | None = None
+    is_tradable_quote: bool = True
 
 
 @dataclass

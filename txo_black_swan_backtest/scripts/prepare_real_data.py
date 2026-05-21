@@ -357,14 +357,21 @@ def audit_expiry_calendar(options: pd.DataFrame, expiry_calendar: ExpiryCalendar
 
 def add_quote_quality_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    status = []
-    spreads = []
-    for row in out.itertuples(index=False):
-        quote_status, spread = classify_quote_quality(getattr(row, "bid"), getattr(row, "ask"))
-        status.append(quote_status)
-        spreads.append(spread)
+    bid = pd.to_numeric(out["bid"], errors="coerce")
+    ask = pd.to_numeric(out["ask"], errors="coerce")
+    mid = (bid + ask) / 2.0
+    spread = (ask - bid) / mid.replace(0, np.nan)
+    status = pd.Series("VALID", index=out.index, dtype="object")
+    status[spread > 0.5] = "EXTREME_SPREAD_WARN"
+    status[spread > 1.0] = "EXTREME_SPREAD_FAIL"
+    status[bid > ask] = "BID_GT_ASK"
+    status[ask == 0] = "ZERO_ASK"
+    status[bid == 0] = "ZERO_BID"
+    status[(bid < 0) | (ask < 0)] = "NEGATIVE_QUOTE"
+    status[ask.isna()] = "MISSING_ASK"
+    status[bid.isna()] = "MISSING_BID"
     out["quote_quality_status"] = status
-    out["spread_pct"] = spreads
+    out["spread_pct"] = spread.where(status.isin(["VALID", "EXTREME_SPREAD_WARN", "EXTREME_SPREAD_FAIL"]))
     out["is_tradable_quote"] = out["quote_quality_status"].eq("VALID")
     return out
 

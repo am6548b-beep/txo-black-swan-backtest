@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date as Date
 from dataclasses import dataclass
 
 from .contracts import Leg, OptionContract, Trade
@@ -23,6 +24,7 @@ def is_liquid(contract: OptionContract, config: dict) -> bool:
         and contract.volume >= float(config.get("wide_spread_volume_threshold", 50))
         and contract.open_interest >= float(config.get("min_open_interest", 100))
         and contract.ask >= contract.bid >= 0
+        and contract.is_tradable_quote
     )
 
 
@@ -71,6 +73,11 @@ def trade_contract(
 
     if quantity <= 0:
         raise ValueError("quantity must be positive")
+    dte_at_trade = _dte_at_trade(date, contract.expiry)
+    if dte_at_trade is None:
+        raise ValueError("dte_at_trade could not be calculated")
+    if dte_at_trade < 0:
+        raise ValueError("cannot trade an expired option")
     price = fill_price(contract, side, config, stress)
     point_value = float(config["txo_point_value"])
     gross = price * point_value * quantity
@@ -94,6 +101,7 @@ def trade_contract(
         cash_flow=cash_flow,
         cost=cost,
         reason=reason,
+        dte_at_trade=dte_at_trade,
         underlying_price_at_trade=contract.underlying,
         txf_close_at_trade=contract.underlying,
         option_bid_at_trade=contract.bid,
@@ -106,8 +114,20 @@ def trade_contract(
         bid_ask_estimated=contract.bid_ask_estimated,
         iv_estimated=contract.iv_estimated,
         delta_estimated=contract.delta_estimated,
+        quote_quality_status=contract.quote_quality_status,
+        spread_pct=contract.spread_pct,
+        is_tradable_quote=contract.is_tradable_quote,
     )
     return fill, trade
+
+
+def _dte_at_trade(trade_date: str, expiry: str) -> int | None:
+    try:
+        trade_dt = Date.fromisoformat(str(trade_date)[:10])
+        expiry_dt = Date.fromisoformat(str(expiry)[:10])
+    except ValueError:
+        return None
+    return (expiry_dt - trade_dt).days
 
 
 def close_leg(

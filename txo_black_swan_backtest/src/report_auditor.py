@@ -16,9 +16,13 @@ def run_report_audit(report_dir: Path) -> pd.DataFrame:
     equity = _read(report_dir / "equity_curve.csv")
     summary = _read(report_dir / "summary.csv")
     macro_dashboard = _read(report_dir / "macro_dashboard.csv")
+    lifecycle_events = _read(report_dir / "position_lifecycle_events.csv")
 
     rows: list[dict] = []
     rows.extend(_audit_trades(trades))
+    lifecycle = _position_lifecycle_audit(trades, equity, lifecycle_events)
+    lifecycle.to_csv(report_dir / "position_lifecycle_audit.csv", index=False)
+    rows.extend(_audit_lifecycle(lifecycle))
     rows.extend(_audit_strikes(trades))
     rows.extend(_audit_execution_prices(trades))
     rows.extend(_audit_equity(equity, summary))
@@ -34,7 +38,7 @@ def run_report_audit(report_dir: Path) -> pd.DataFrame:
 
 def _audit_trades(trades: pd.DataFrame) -> list[dict]:
     rows = []
-    required = {"date", "position_id", "strategy", "action", "cp", "strike", "expiry", "quantity", "price", "cash_flow", "cost", "reason"}
+    required = {"date", "position_id", "strategy", "action", "cp", "strike", "expiry", "quantity", "price", "cash_flow", "cost", "reason", "dte_at_trade"}
     audit_cols = {
         "underlying_price_at_trade",
         "txf_close_at_trade",
@@ -48,6 +52,9 @@ def _audit_trades(trades: pd.DataFrame) -> list[dict]:
         "bid_ask_estimated",
         "iv_estimated",
         "delta_estimated",
+        "quote_quality_status",
+        "spread_pct",
+        "is_tradable_quote",
     }
     if trades.empty:
         return [_row("trades_integrity", "trades_csv_present", "FAIL", "trades.csv missing or empty")]
@@ -62,6 +69,7 @@ def _audit_trades(trades: pd.DataFrame) -> list[dict]:
     rows.append(_finite_check("trades_integrity", "abs_qty_positive", trades["quantity"].abs(), positive=True))
     rows.append(_finite_check("trades_integrity", "cash_flow_finite", trades["cash_flow"]))
     rows.append(_finite_check("trades_integrity", "cost_finite", trades["cost"]))
+    rows.extend(_audit_trade_dates(trades))
 
     ps = trades[trades["strategy"] == "put_spread"].copy()
     if ps.empty:
@@ -78,6 +86,112 @@ def _audit_trades(trades: pd.DataFrame) -> list[dict]:
     rows.append(_row("trades_integrity", "orphan_or_open_legs", "PASS" if orphan.empty else "WARN", f"unbalanced legs={len(orphan)}"))
     net_by_position = ps.groupby("position_id")["quantity"].sum()
     rows.append(_row("trades_integrity", "single_leg_unclosed", "PASS" if (net_by_position == 0).all() else "WARN", f"positions with net signed qty={int((net_by_position != 0).sum())}"))
+    return rows
+
+
+def _audit_trade_dates(trades: pd.DataFrame) -> list[dict]:
+    if "dte_at_trade" not in trades:
+        return [_row("trade_dates", "missing_dte_at_trade", "FAIL", "dte_at_trade column missing")]
+    rows: list[dict] = []
+    dte = pd.to_numeric(trades["dte_at_trade"], errors="coerce")
+    missing = int(dte.isna().sum())
+    rows.append(_row("trade_dates", "missing_dte_at_trade", "FAIL" if missing else "PASS", f"rows={missing}"))
+    negative = int((dte < 0).sum())
+    rows.append(_row("trade_dates", "dte_at_trade_negative", "FAIL" if negative else "PASS", f"rows={negative}"))
+    trade_date = pd.to_datetime(trades["date"], errors="coerce")
+    expiry = pd.to_datetime(trades["expiry"], errors="coerce")
+    after_expiry = int((trade_date > expiry).sum())
+    rows.append(_row("trade_dates", "trade_date_after_expiry", "FAIL" if after_expiry else "PASS", f"rows={after_expiry}"))
+    exit_rows = trades[~trades["reason"].str.contains("open", case=False, na=False)].copy()
+    exit_after = 0 if exit_rows.empty else int((pd.to_datetime(exit_rows["date"], errors="coerce") > pd.to_datetime(exit_rows["expiry"], errors="coerce")).sum())
+    rows.append(_row("trade_dates", "exit_after_expiry", "FAIL" if exit_after else "PASS", f"rows={exit_after}"))
+    expected = (expiry - trade_date).dt.days
+    mismatch = int((dte.notna() & expected.notna() & (dte != expected)).sum())
+    rows.append(_row("trade_dates", "quote_lookup_mismatch_expiry", "FAIL" if mismatch else "PASS", f"dte_mismatch_rows={mismatch}"))
+    return rows
+
+
+def _position_lifecycle_audit(trades: pd.DataFrame, equity: pd.DataFrame, lifecycle_events: pd.DataFrame | None = None) -> pd.DataFrame:
+    columns = [
+        "position_id",
+        "entry_date",
+        "expiry",
+        "exit_date",
+        "entry_legs",
+        "exit_legs",
+        "min_dte_at_exit",
+        "max_dte_at_exit",
+        "exit_reason",
+        "status",
+        "issue",
+    ]
+    if trades.empty or "position_id" not in trades:
+        return pd.DataFrame(columns=columns)
+    last_date = pd.to_datetime(equity["date"], errors="coerce").max() if not equity.empty and "date" in equity else pd.NaT
+    event_map = {}
+    if lifecycle_events is not None and not lifecycle_events.empty and "position_id" in lifecycle_events:
+        event_map = {str(row.position_id): row for row in lifecycle_events.itertuples(index=False)}
+    records: list[dict] = []
+    for pid, group in trades.groupby("position_id"):
+        open_rows = group[group["reason"].str.contains("open", case=False, na=False)].copy()
+        exit_rows = group[~group.index.isin(open_rows.index)].copy()
+        entry_date = pd.to_datetime(open_rows["date"], errors="coerce").min() if not open_rows.empty else pd.NaT
+        expiry = pd.to_datetime(group["expiry"], errors="coerce").min()
+        exit_date = pd.to_datetime(exit_rows["date"], errors="coerce").max() if not exit_rows.empty else pd.NaT
+        exit_dte = pd.to_numeric(exit_rows["dte_at_trade"], errors="coerce") if "dte_at_trade" in exit_rows else pd.Series(dtype=float)
+        duplicate_exit = False
+        if not exit_rows.empty:
+            duplicate_exit = bool(exit_rows.duplicated(["position_id", "cp", "strike", "expiry", "action", "reason", "date"], keep=False).any())
+        event = event_map.get(str(pid))
+        if event is not None:
+            status = str(getattr(event, "status", "WARN"))
+            issue = str(getattr(event, "issue", "forced_unfilled_exit"))
+            event_exit = pd.to_datetime(getattr(event, "exit_date", pd.NaT), errors="coerce")
+            if pd.notna(event_exit):
+                exit_date = event_exit
+        elif not exit_rows.empty and pd.notna(exit_date) and pd.notna(expiry) and exit_date > expiry:
+            status = "FAIL"
+            issue = "exit_after_expiry"
+        elif duplicate_exit:
+            status = "FAIL"
+            issue = "duplicate_exit_legs"
+        elif exit_rows.empty and pd.notna(last_date) and pd.notna(expiry) and last_date > expiry:
+            status = "FAIL"
+            issue = "expired_position_still_active"
+        elif exit_rows.empty:
+            status = "WARN"
+            issue = "open_position_no_exit"
+        else:
+            status = "PASS"
+            issue = ""
+        records.append(
+            {
+                "position_id": pid,
+                "entry_date": "" if pd.isna(entry_date) else str(entry_date.date()),
+                "expiry": "" if pd.isna(expiry) else str(expiry.date()),
+                "exit_date": "" if pd.isna(exit_date) else str(exit_date.date()),
+                "entry_legs": int(len(open_rows)),
+                "exit_legs": int(len(exit_rows)),
+                "min_dte_at_exit": "" if exit_dte.empty or exit_dte.isna().all() else int(exit_dte.min()),
+                "max_dte_at_exit": "" if exit_dte.empty or exit_dte.isna().all() else int(exit_dte.max()),
+                "exit_reason": ";".join(sorted(exit_rows["reason"].dropna().astype(str).unique())) if not exit_rows.empty else "",
+                "status": status,
+                "issue": issue,
+            }
+        )
+    return pd.DataFrame(records, columns=columns)
+
+
+def _audit_lifecycle(lifecycle: pd.DataFrame) -> list[dict]:
+    if lifecycle.empty:
+        return [_row("position_lifecycle", "position_lifecycle_audit_present", "WARN", "no positions")]
+    rows = [_row("position_lifecycle", "position_lifecycle_audit_present", "PASS", f"rows={len(lifecycle)}")]
+    counts = lifecycle["status"].value_counts().to_dict()
+    aggregate_status = "FAIL" if counts.get("FAIL", 0) else ("WARN" if counts.get("WARN", 0) else "PASS")
+    rows.append(_row("position_lifecycle", "position_lifecycle_status_distribution", aggregate_status, str(counts)))
+    for issue in ["expired_position_still_active", "duplicate_exit_legs", "exit_after_expiry"]:
+        count = int((lifecycle["issue"] == issue).sum())
+        rows.append(_row("position_lifecycle", issue, "FAIL" if count else "PASS", f"rows={count}"))
     return rows
 
 
@@ -151,10 +265,44 @@ def _audit_execution_prices(trades: pd.DataFrame) -> list[dict]:
     if {"commission_paid", "tax_paid"} <= set(trades.columns):
         cost_diff = (pd.to_numeric(trades["commission_paid"], errors="coerce") + pd.to_numeric(trades["tax_paid"], errors="coerce") - pd.to_numeric(trades["cost"], errors="coerce")).abs().max()
         rows.append(_row("execution_reasonableness", "commission_tax_sum_to_cost", "PASS" if cost_diff < 1e-8 else "FAIL", f"max_abs_diff={cost_diff:.10f}"))
+    rows.extend(_audit_trade_quote_quality(trades))
     total_cost = float(trades["cost"].sum()) if "cost" in trades else 0.0
     turnover = float(trades["cash_flow"].abs().sum()) if "cash_flow" in trades else 0.0
     rows.append(_row("execution_reasonableness", "fee_tax_cost_summary", "PASS", f"reported_cost={total_cost:.2f}, turnover={turnover:.2f}; slippage_pct_used is now recorded per leg"))
     return rows
+
+
+def _audit_trade_quote_quality(trades: pd.DataFrame) -> list[dict]:
+    needed = {"quote_quality_status", "is_tradable_quote"}
+    if not needed <= set(trades.columns):
+        return [
+            _row(
+                "quote_quality",
+                "quote_quality_columns_present",
+                "WARN",
+                f"missing columns={sorted(needed - set(trades.columns))}",
+            )
+        ]
+    status = trades["quote_quality_status"].fillna("UNKNOWN").astype(str)
+    tradable = _bool_series(trades["is_tradable_quote"])
+    non_valid = status.ne("VALID")
+    non_tradable = ~tradable
+    distribution = "; ".join(f"{idx}={val}" for idx, val in status.value_counts(dropna=False).items())
+    return [
+        _row("quote_quality", "traded_legs_quote_quality_status_distribution", "PASS", distribution),
+        _row(
+            "quote_quality",
+            "no_trades_with_is_tradable_quote_false",
+            "FAIL" if non_tradable.any() else "PASS",
+            f"bad_legs={int(non_tradable.sum())}",
+        ),
+        _row(
+            "quote_quality",
+            "no_trades_with_non_valid_quote_quality",
+            "FAIL" if non_valid.any() else "PASS",
+            f"bad_legs={int(non_valid.sum())}",
+        ),
+    ]
 
 
 def _audit_equity(equity: pd.DataFrame, summary: pd.DataFrame) -> list[dict]:

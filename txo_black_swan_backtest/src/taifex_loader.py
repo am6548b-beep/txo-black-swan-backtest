@@ -59,6 +59,9 @@ def load_taifex_options(raw_dir: Path) -> pd.DataFrame:
     out["iv"] = _num(df, ["iv", "IV", "implied_vol", "隱含波動率"], fallback=np.nan)
     out["delta"] = _num(df, ["delta", "Delta"], fallback=np.nan)
     out["dte"] = (pd.to_datetime(out["expiry"]) - pd.to_datetime(out["date"])).dt.days
+    out["quote_quality_status"] = "UNKNOWN"
+    out["spread_pct"] = np.nan
+    out["is_tradable_quote"] = True
     out = out.dropna(subset=["date", "expiry", "cp", "strike", "close"])
     return out[OPTION_COLUMNS].sort_values(["date", "expiry", "cp", "strike"]).reset_index(drop=True)
 
