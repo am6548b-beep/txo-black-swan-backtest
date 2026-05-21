@@ -60,6 +60,9 @@ OPTION_COLUMNS = [
     "iv_estimated",
     "delta_estimated",
     "bid_ask_estimated",
+    "quote_quality_status",
+    "spread_pct",
+    "is_tradable_quote",
     "data_source",
     "source_file",
 ]
@@ -73,6 +76,14 @@ class AuditItem:
     detail: str
 
 
+@dataclass(frozen=True)
+class ExpiryCalendar:
+    path: Path
+    exists: bool
+    overrides: dict[str, pd.Timestamp]
+    warnings: tuple[str, ...]
+
+
 def main() -> None:
     args = parse_args()
     raw_dir = Path(args.raw_dir)
@@ -81,18 +92,20 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    expiry_calendar = load_expiry_calendar(raw_dir / "taifex" / "txo_expiry_calendar.csv")
     txf_market = load_txf_1min(raw_dir / "taifex" / "txf")
     official_market = load_official_futures(raw_dir / "taifex" / "fut")
     market = merge_market_sources(txf_market, official_market)
-    options = load_official_options(raw_dir / "taifex" / "opt")
+    options = load_official_options(raw_dir / "taifex" / "opt", expiry_calendar)
 
     market.to_csv(out_dir / "market.csv", index=False)
     options[[col for col in OPTION_COLUMNS if col in options.columns]].to_csv(out_dir / "options.csv", index=False)
 
-    audit = build_audit(market, options, txf_market, official_market)
+    audit = build_audit(market, options, txf_market, official_market, expiry_calendar)
     audit_df = pd.DataFrame([item.__dict__ for item in audit])
     audit_df.to_csv(report_dir / "data_cleaning_audit.csv", index=False)
     debug_counts = write_debug_outputs(report_dir, options)
+    write_quote_quality_reports(report_dir, options)
     write_audit_markdown(report_dir / "data_cleaning_audit.md", audit_df, market, options)
 
     counts = audit_df["status"].value_counts().to_dict() if not audit_df.empty else {}
@@ -203,7 +216,7 @@ def merge_market_sources(txf_market: pd.DataFrame, official_market: pd.DataFrame
     return combined.drop(columns=["source_priority"]).sort_values("date").reset_index(drop=True)[MARKET_COLUMNS]
 
 
-def load_official_options(opt_dir: Path) -> pd.DataFrame:
+def load_official_options(opt_dir: Path, expiry_calendar: ExpiryCalendar | None = None) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for path in sorted(opt_dir.glob("*.csv")):
         df = read_csv_with_encoding(path)
@@ -222,9 +235,16 @@ def load_official_options(opt_dir: Path) -> pd.DataFrame:
         out["contract"] = col_or_nan(txo, ["契約"]).astype(str).str.strip()
         expiry_raw = col_or_nan(txo, ["到期月份(週別)", "到期月份"]).astype(str).str.strip()
         out["expiry_raw"] = expiry_raw
-        expiry_lookup = {raw: parse_taifex_expiry(raw) for raw in expiry_raw.dropna().unique()}
+        rule_lookup = {raw: parse_expiry_by_rule(raw) for raw in expiry_raw.dropna().unique()}
+        expiry_lookup = {raw: parse_taifex_expiry(raw, expiry_calendar.overrides if expiry_calendar else None) for raw in expiry_raw.dropna().unique()}
+        out["rule_expiry"] = expiry_raw.map(rule_lookup)
         out["expiry"] = expiry_raw.map(expiry_lookup)
         out["dte"] = (pd.to_datetime(out["expiry"]) - pd.to_datetime(out["date"])).dt.days
+        out["rule_dte"] = (pd.to_datetime(out["rule_expiry"]) - pd.to_datetime(out["date"])).dt.days
+        out["override_used"] = [
+            bool(raw in expiry_calendar.overrides and pd.notna(expiry_calendar.overrides[raw])) if expiry_calendar else False
+            for raw in expiry_raw
+        ]
         out["cp"] = col_or_nan(txo, ["買賣權"]).map(normalize_cp)
         out["strike"] = to_number(col_or_nan(txo, ["履約價"]))
         out["open"] = to_number(col_or_nan(txo, ["開盤價"]))
@@ -244,13 +264,20 @@ def load_official_options(opt_dir: Path) -> pd.DataFrame:
         out["iv_estimated"] = False
         out["delta_estimated"] = False
         out["bid_ask_estimated"] = False
+        out = add_quote_quality_columns(out)
         out["data_source"] = "taifex_official_daily"
         out["source_file"] = path.name
-        frames.append(out[OPTION_COLUMNS + ["expiry_raw"]])
-    return concat_or_empty(frames, OPTION_COLUMNS + ["expiry_raw"]).reset_index(drop=True)
+        frames.append(out[OPTION_COLUMNS + ["expiry_raw", "rule_expiry", "rule_dte", "override_used"]])
+    return concat_or_empty(frames, OPTION_COLUMNS + ["expiry_raw", "rule_expiry", "rule_dte", "override_used"]).reset_index(drop=True)
 
 
-def build_audit(market: pd.DataFrame, options: pd.DataFrame, txf_market: pd.DataFrame, official_market: pd.DataFrame) -> list[AuditItem]:
+def build_audit(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    txf_market: pd.DataFrame,
+    official_market: pd.DataFrame,
+    expiry_calendar: ExpiryCalendar,
+) -> list[AuditItem]:
     rows: list[AuditItem] = []
     rows.extend(audit_market("market", market))
     rows.extend(audit_options("options", options))
@@ -260,6 +287,7 @@ def build_audit(market: pd.DataFrame, options: pd.DataFrame, txf_market: pd.Data
     rows.append(AuditItem("market", "crazyindicator_rows", "PASS" if len(txf_market) > 0 else "WARN", f"rows={len(txf_market)}"))
     rows.append(AuditItem("options", "weekly_monthly_distribution", "PASS", distribution(options, "is_weekly")))
     rows.append(AuditItem("options", "source_file_distribution", "PASS", distribution(options, "source_file")))
+    rows.extend(audit_expiry_calendar(options, expiry_calendar))
     return rows
 
 
@@ -301,6 +329,79 @@ def audit_options(name: str, df: pd.DataFrame) -> list[AuditItem]:
     dup_contracts = int(df.duplicated(contract_keys, keep=False).sum())
     rows.append(AuditItem(name, "duplicate_contracts", "WARN" if dup_contracts else "PASS", f"rows={dup_contracts}"))
     return rows
+
+
+def audit_expiry_calendar(options: pd.DataFrame, expiry_calendar: ExpiryCalendar) -> list[AuditItem]:
+    override_used = int(options["override_used"].fillna(False).sum()) if "override_used" in options else 0
+    before = bad_expiry_count(options, "rule_expiry", "rule_dte")
+    after = bad_expiry_count(options, "expiry", "dte")
+    warnings = len(expiry_calendar.warnings)
+    return [
+        AuditItem(
+            "expiry_calendar",
+            "override_file_exists",
+            "PASS" if expiry_calendar.exists else "WARN",
+            str(expiry_calendar.path) if expiry_calendar.exists else f"missing: {expiry_calendar.path}",
+        ),
+        AuditItem("expiry_calendar", "override_used_count", "PASS", f"rows={override_used}"),
+        AuditItem("expiry_calendar", "bad_expiry_before_override", "WARN" if before else "PASS", f"rows={before}"),
+        AuditItem("expiry_calendar", "bad_expiry_after_override", "WARN" if after else "PASS", f"rows={after}"),
+        AuditItem(
+            "expiry_calendar",
+            "override_warnings",
+            "WARN" if warnings else "PASS",
+            "; ".join(expiry_calendar.warnings[:20]) if warnings else "none",
+        ),
+    ]
+
+
+def add_quote_quality_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    status = []
+    spreads = []
+    for row in out.itertuples(index=False):
+        quote_status, spread = classify_quote_quality(getattr(row, "bid"), getattr(row, "ask"))
+        status.append(quote_status)
+        spreads.append(spread)
+    out["quote_quality_status"] = status
+    out["spread_pct"] = spreads
+    out["is_tradable_quote"] = out["quote_quality_status"].eq("VALID")
+    return out
+
+
+def classify_quote_quality(bid: object, ask: object) -> tuple[str, float]:
+    bid_value = pd.to_numeric(pd.Series([bid]), errors="coerce").iloc[0]
+    ask_value = pd.to_numeric(pd.Series([ask]), errors="coerce").iloc[0]
+    if pd.isna(bid_value):
+        return "MISSING_BID", np.nan
+    if pd.isna(ask_value):
+        return "MISSING_ASK", np.nan
+    bid_float = float(bid_value)
+    ask_float = float(ask_value)
+    if bid_float < 0 or ask_float < 0:
+        return "NEGATIVE_QUOTE", np.nan
+    if bid_float == 0:
+        return "ZERO_BID", np.nan
+    if ask_float == 0:
+        return "ZERO_ASK", np.nan
+    if bid_float > ask_float:
+        return "BID_GT_ASK", np.nan
+    mid = (bid_float + ask_float) / 2.0
+    spread = np.nan if mid == 0 else (ask_float - bid_float) / mid
+    if pd.notna(spread) and spread > 1.0:
+        return "EXTREME_SPREAD_FAIL", float(spread)
+    if pd.notna(spread) and spread > 0.5:
+        return "EXTREME_SPREAD_WARN", float(spread)
+    return "VALID", float(spread)
+
+
+def bad_expiry_count(options: pd.DataFrame, expiry_col: str, dte_col: str) -> int:
+    if options.empty or expiry_col not in options or dte_col not in options:
+        return 0
+    date = pd.to_datetime(options["date"], errors="coerce")
+    expiry = pd.to_datetime(options[expiry_col], errors="coerce")
+    mask = ((expiry.notna()) & (date.notna()) & (expiry < date)) | (options[dte_col].notna() & (options[dte_col] < 0))
+    return int(mask.sum())
 
 
 def basic_audit(name: str, df: pd.DataFrame, required: list[str]) -> list[AuditItem]:
@@ -401,7 +502,47 @@ def expiry_sort_key(values: pd.Series) -> pd.Series:
     return pd.to_numeric(text, errors="coerce").fillna(999999)
 
 
-def parse_taifex_expiry(value: object) -> pd.Timestamp | pd.NaT:
+def load_expiry_calendar(path: Path) -> ExpiryCalendar:
+    if not path.exists():
+        return ExpiryCalendar(path=path, exists=False, overrides={}, warnings=())
+    warnings: list[str] = []
+    overrides: dict[str, pd.Timestamp] = {}
+    try:
+        df = read_csv_with_encoding(path)
+    except Exception as exc:
+        return ExpiryCalendar(path=path, exists=True, overrides={}, warnings=(f"read_failed: {exc}",))
+    df = normalize_columns(df)
+    missing = [col for col in ["expiry_raw", "actual_expiry"] if col not in df.columns]
+    if missing:
+        return ExpiryCalendar(path=path, exists=True, overrides={}, warnings=(f"missing_columns: {','.join(missing)}",))
+    for row in df.itertuples(index=False):
+        raw = str(getattr(row, "expiry_raw")).strip().upper()
+        actual = pd.to_datetime(getattr(row, "actual_expiry"), errors="coerce")
+        if not raw or raw == "NAN":
+            warnings.append("blank_expiry_raw")
+            continue
+        if pd.isna(actual):
+            warnings.append(f"{raw}: invalid actual_expiry")
+            continue
+        if expiry_raw_pattern(raw) == "unrecognized":
+            warnings.append(f"{raw}: invalid expiry_raw format")
+            continue
+        reasonable_floor = expiry_month_floor(raw)
+        if pd.notna(reasonable_floor) and actual < reasonable_floor:
+            warnings.append(f"{raw}: actual_expiry before contract month")
+            continue
+        overrides[raw] = pd.Timestamp(actual).normalize()
+    return ExpiryCalendar(path=path, exists=True, overrides=overrides, warnings=tuple(warnings))
+
+
+def parse_taifex_expiry(value: object, overrides: dict[str, pd.Timestamp] | None = None) -> pd.Timestamp | pd.NaT:
+    text = str(value).strip().upper()
+    if overrides and text in overrides:
+        return overrides[text]
+    return parse_expiry_by_rule(text)
+
+
+def parse_expiry_by_rule(value: object) -> pd.Timestamp | pd.NaT:
     text = str(value).strip().upper()
     match = re.fullmatch(r"(\d{4})(\d{2})(?:([WF])([1-5]))?", text)
     if match is None:
@@ -415,6 +556,18 @@ def parse_taifex_expiry(value: object) -> pd.Timestamp | pd.NaT:
     weekday = calendar.FRIDAY if marker == "F" else calendar.WEDNESDAY
     day = nth_weekday(year, month, weekday, nth)
     return pd.Timestamp(year=year, month=month, day=day) if day is not None else pd.NaT
+
+
+def expiry_month_floor(value: object) -> pd.Timestamp | pd.NaT:
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"(\d{4})(\d{2})(?:([WF])([1-5]))?", text)
+    if match is None:
+        return pd.NaT
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return pd.NaT
+    return pd.Timestamp(year=year, month=month, day=1)
 
 
 def nth_weekday(year: int, month: int, weekday: int, nth: int) -> int | None:
@@ -472,6 +625,113 @@ def write_debug_outputs(report_dir: Path, options: pd.DataFrame) -> dict[str, in
         "bad_bid_ask_rows": int(len(bad_bid_ask)),
         "extreme_spread_rows_sample": int(min(len(extreme_spread), 5000)),
     }
+
+
+def write_quote_quality_reports(report_dir: Path, options: pd.DataFrame) -> None:
+    rows: list[dict[str, str | int | float]] = []
+    total = len(options)
+    tradable = int(options["is_tradable_quote"].fillna(False).sum()) if "is_tradable_quote" in options else 0
+    rows.append(
+        {
+            "section": "summary",
+            "bucket": "is_tradable_quote_ratio",
+            "quote_quality_status": "ALL",
+            "count": tradable,
+            "total": total,
+            "ratio": tradable / total if total else np.nan,
+        }
+    )
+    rows.extend(quote_quality_distribution(options, "overall", pd.Series("ALL", index=options.index)))
+    if "date" in options:
+        years = pd.to_datetime(options["date"], errors="coerce").dt.year.astype("Int64").astype(str)
+        rows.extend(quote_quality_distribution(options, "by_year", years))
+    if "source_file" in options:
+        rows.extend(quote_quality_distribution(options, "by_source_file", options["source_file"].astype(str)))
+    if "dte" in options:
+        dte_bucket = pd.cut(
+            options["dte"],
+            bins=[-np.inf, 0, 7, 14, 30, 60, 120, np.inf],
+            labels=["<0", "0-7", "8-14", "15-30", "31-60", "61-120", ">120"],
+        ).astype(str)
+        rows.extend(quote_quality_distribution(options, "by_dte_bucket", dte_bucket))
+    if "volume" in options:
+        volume_bucket = pd.cut(
+            options["volume"].fillna(-1),
+            bins=[-np.inf, 0, 10, 50, 100, 500, np.inf],
+            labels=["missing_or_0", "1-10", "11-50", "51-100", "101-500", ">500"],
+        ).astype(str)
+        rows.extend(quote_quality_distribution(options, "by_volume_bucket", volume_bucket))
+    if "open_interest" in options:
+        oi_bucket = pd.cut(
+            options["open_interest"].fillna(-1),
+            bins=[-np.inf, 0, 10, 50, 100, 500, 1000, np.inf],
+            labels=["missing_or_0", "1-10", "11-50", "51-100", "101-500", "501-1000", ">1000"],
+        ).astype(str)
+        rows.extend(quote_quality_distribution(options, "by_open_interest_bucket", oi_bucket))
+
+    report = pd.DataFrame(rows)
+    report.to_csv(report_dir / "options_quote_quality.csv", index=False)
+    write_quote_quality_markdown(report_dir / "options_quote_quality.md", options, report)
+
+
+def quote_quality_distribution(options: pd.DataFrame, section: str, buckets: pd.Series) -> list[dict[str, str | int | float]]:
+    if options.empty or "quote_quality_status" not in options:
+        return []
+    work = pd.DataFrame({"bucket": buckets.fillna("nan").astype(str), "quote_quality_status": options["quote_quality_status"].astype(str)})
+    grouped = work.groupby(["bucket", "quote_quality_status"], dropna=False).size().reset_index(name="count")
+    totals = work.groupby("bucket", dropna=False).size().rename("total")
+    grouped = grouped.merge(totals, on="bucket", how="left")
+    grouped["ratio"] = grouped["count"] / grouped["total"]
+    grouped.insert(0, "section", section)
+    return grouped.to_dict("records")
+
+
+def write_quote_quality_markdown(path: Path, options: pd.DataFrame, report: pd.DataFrame) -> None:
+    total = len(options)
+    counts = options["quote_quality_status"].value_counts(dropna=False).to_dict() if "quote_quality_status" in options else {}
+    tradable = int(options["is_tradable_quote"].fillna(False).sum()) if "is_tradable_quote" in options else 0
+    lines = [
+        "# Options Quote Quality",
+        "",
+        "This report only labels quote quality. It does not fix bid/ask, delete rows, estimate missing prices, or change strategy logic.",
+        "",
+        "## Summary",
+        "",
+        f"- total rows: {total}",
+        f"- is_tradable_quote rows: {tradable}",
+        f"- is_tradable_quote ratio: {tradable / total:.6f}" if total else "- is_tradable_quote ratio: nan",
+        "",
+        "## quote_quality_status Distribution",
+        "",
+    ]
+    if counts:
+        for status, count in counts.items():
+            lines.append(f"- {status}: {int(count)}")
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## Top Non-VALID By Source File",
+            "",
+        ]
+    )
+    non_valid = report[(report["section"] == "by_source_file") & (report["quote_quality_status"] != "VALID")] if not report.empty else pd.DataFrame()
+    if non_valid.empty:
+        lines.append("- none")
+    else:
+        top = non_valid.sort_values("count", ascending=False).head(20)
+        for row in top.itertuples(index=False):
+            lines.append(f"- {row.bucket} / {row.quote_quality_status}: {int(row.count)}")
+    lines.extend(
+        [
+            "",
+            "## Bucket Reports",
+            "",
+            "- Full distributions are in `reports/options_quote_quality.csv`.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def bad_expiry_rows(options: pd.DataFrame) -> pd.DataFrame:
@@ -552,6 +812,9 @@ def write_audit_markdown(path: Path, audit: pd.DataFrame, market: pd.DataFrame, 
             "",
             "## Debug Diagnostics",
             "",
+            f"- override used count: {diagnostics['override_used_count']}",
+            f"- bad expiry count before override: {diagnostics['bad_expiry_before_override']}",
+            f"- bad expiry count after override: {diagnostics['bad_expiry_count']}",
             f"- bad expiry count: {diagnostics['bad_expiry_count']}",
             f"- bad expiry first 20 expiry_raw examples: {diagnostics['bad_expiry_examples']}",
             f"- bad expiry by expiry_raw pattern: {diagnostics['bad_expiry_by_pattern']}",
@@ -563,6 +826,8 @@ def write_audit_markdown(path: Path, audit: pd.DataFrame, market: pd.DataFrame, 
             f"- extreme spread by volume bucket: {diagnostics['extreme_spread_by_volume_bucket']}",
             f"- ask = 0 count: {diagnostics['ask_zero_count']}",
             f"- bid = 0 count: {diagnostics['bid_zero_count']}",
+            f"- quote_quality_status distribution: {diagnostics['quote_quality_distribution']}",
+            f"- is_tradable_quote ratio: {diagnostics['is_tradable_quote_ratio']}",
         ]
     )
     lines.extend(
@@ -605,6 +870,8 @@ def build_debug_summary(options: pd.DataFrame) -> dict[str, str | int]:
         else []
     )
     return {
+        "override_used_count": int(options["override_used"].fillna(False).sum()) if "override_used" in options else 0,
+        "bad_expiry_before_override": bad_expiry_count(options, "rule_expiry", "rule_dte"),
         "bad_expiry_count": int(len(bad_expiry)),
         "bad_expiry_examples": "; ".join(examples) if examples else "none",
         "bad_expiry_by_pattern": value_counts_detail(bad_expiry["expiry_raw"].map(expiry_raw_pattern)) if "expiry_raw" in bad_expiry else "none",
@@ -616,6 +883,10 @@ def build_debug_summary(options: pd.DataFrame) -> dict[str, str | int]:
         "extreme_spread_by_volume_bucket": volume_detail,
         "ask_zero_count": int((options["ask"].fillna(np.nan) == 0).sum()) if "ask" in options else 0,
         "bid_zero_count": int((options["bid"].fillna(np.nan) == 0).sum()) if "bid" in options else 0,
+        "quote_quality_distribution": value_counts_detail(options["quote_quality_status"]) if "quote_quality_status" in options else "none",
+        "is_tradable_quote_ratio": (
+            f"{float(options['is_tradable_quote'].fillna(False).mean()):.6f}" if "is_tradable_quote" in options and len(options) else "nan"
+        ),
     }
 
 
