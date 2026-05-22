@@ -13,6 +13,8 @@ from src.data_pipeline import build_processed_data
 from src.data_validation import validate_data
 from src.pathing import ensure_data_layout, resolve_processed_data_dir, resolve_raw_data_dir, resolve_runtime_data_dir
 from src.put_spread_analysis import write_put_spread_real_data_analysis
+from src.put_spread_coverage import write_put_spread_coverage_audit
+from src.put_spread_variants import run_put_spread_variants
 from src.reports import write_reports
 from src.report_auditor import run_report_audit
 from src.stress_tests import run_stress_suite
@@ -37,6 +39,8 @@ def parse_args() -> argparse.Namespace:
             "build_dataset",
             "report_audit",
             "put_spread_analysis",
+            "put_spread_coverage",
+            "put_spread_variants",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
@@ -85,10 +89,12 @@ def main() -> None:
     if args.mode == "report_audit":
         audit = run_report_audit(root / "reports")
         write_put_spread_real_data_analysis(root / "reports", processed_data_dir)
+        write_put_spread_coverage_audit(root / "reports", processed_data_dir, config, put_params)
         counts = audit["status"].value_counts().to_dict() if not audit.empty else {}
         print(f"Report audit written to {root / 'reports' / 'report_audit.csv'}")
         print(f"Report audit markdown written to {root / 'reports' / 'report_audit.md'}")
         print(f"Put spread analysis written to {root / 'reports' / 'put_spread_real_data_analysis.csv'}")
+        print(f"Put spread coverage audit written to {root / 'reports' / 'put_spread_coverage_audit.csv'}")
         print(f"Status counts: {counts}")
         return
 
@@ -96,6 +102,19 @@ def main() -> None:
         analysis = write_put_spread_real_data_analysis(root / "reports", processed_data_dir)
         print(f"Put spread analysis written to {root / 'reports' / 'put_spread_real_data_analysis.csv'}")
         print(f"Rows: {len(analysis)}")
+        return
+
+    if args.mode == "put_spread_coverage":
+        coverage, entry = write_put_spread_coverage_audit(root / "reports", processed_data_dir, config, put_params)
+        print(f"Put spread coverage audit written to {root / 'reports' / 'put_spread_coverage_audit.csv'}")
+        print(f"Put spread entry signal audit written to {root / 'reports' / 'put_spread_entry_signal_audit.csv'}")
+        print(f"Rows: coverage={len(coverage)}, entry={len(entry)}")
+        return
+
+    if args.mode == "put_spread_variants":
+        comparison = run_put_spread_variants(processed_data_dir, root / "reports", config, put_params, ic_params)
+        print(f"Put spread variant comparison written to {root / 'reports' / 'put_spread_variant_comparison.csv'}")
+        print(f"Rows: {len(comparison)}")
         return
 
     if args.mode == "stress":
