@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.put_spread_variants import PutSpreadVariantStateMachine, run_put_spread_variants
+from src.put_spread_variants import PutSpreadVariantStateMachine, _entry_time_feasibility_filter, run_put_spread_variants
 
 
 def _config() -> dict:
@@ -106,6 +106,48 @@ def _options(date: str, valid: bool = True, expired: bool = False) -> pd.DataFra
     )
 
 
+def _history_options(entry_date: str, past_valid_days: int, past_invalid_days: int, future_valid_days: int = 0) -> pd.DataFrame:
+    entry = pd.Timestamp(entry_date)
+    expiry = str((entry + pd.Timedelta(days=106)).date())
+    rows = []
+    for i in range(past_invalid_days):
+        rows.append((entry - pd.Timedelta(days=past_invalid_days + past_valid_days - i), "ZERO_BID", False, 0, 0, 1.2))
+    for i in range(past_valid_days):
+        rows.append((entry - pd.Timedelta(days=past_valid_days - i), "VALID", True, 500, 1000, 0.1))
+    rows.append((entry, "VALID", True, 500, 1000, 0.1))
+    for i in range(future_valid_days):
+        rows.append((entry + pd.Timedelta(days=i + 1), "VALID", True, 500, 1000, 0.1))
+    out = []
+    for date, status, tradable, volume, oi, spread in rows:
+        for strike in [9000.0, 7500.0]:
+            out.append(
+                {
+                    "date": date,
+                    "expiry": pd.Timestamp(expiry),
+                    "dte": 106,
+                    "cp": "P",
+                    "strike": strike,
+                    "close": 20.0,
+                    "bid": 19.0,
+                    "ask": 21.0,
+                    "volume": volume,
+                    "open_interest": oi,
+                    "iv": 0.2,
+                    "delta": -0.1,
+                    "underlying": 10000.0,
+                    "tradable": tradable,
+                    "reason": "",
+                    "bid_ask_estimated": False,
+                    "iv_estimated": False,
+                    "delta_estimated": False,
+                    "quote_quality_status": status,
+                    "spread_pct": spread,
+                    "is_tradable_quote": tradable,
+                }
+            )
+    return pd.DataFrame(out)
+
+
 def test_quarterly_base_insurance_does_not_depend_on_original_market_signal() -> None:
     dates = ["2024-01-02"]
     engine = PutSpreadVariantStateMachine(
@@ -204,3 +246,67 @@ def test_quarterly_entry_uses_current_quarter_check_without_future_retry() -> No
     )
     _, trades = engine.run()
     assert trades.empty
+
+
+def test_variant_d_does_not_modify_quarterly_base_result() -> None:
+    dates = ["2024-01-02"]
+    options = _history_options("2024-01-02", past_valid_days=0, past_invalid_days=10)
+    quarterly = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="quarterly_base_insurance",
+    )
+    variant_d = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="quarterly_base_insurance_feasible_only",
+    )
+
+    _, quarterly_trades = quarterly.run()
+    _, d_trades = variant_d.run()
+
+    assert len(quarterly_trades) == 2
+    assert d_trades.empty
+
+
+def test_variant_d_excludes_only_exit_unlikely_not_fragile() -> None:
+    dates = ["2024-01-02"]
+    options = _history_options("2024-01-02", past_valid_days=1, past_invalid_days=0)
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="quarterly_base_insurance_feasible_only",
+    )
+    _, trades = engine.run()
+    assert len(trades) == 2
+
+
+def test_entry_time_feasibility_filter_ignores_future_data() -> None:
+    options = _history_options("2024-01-02", past_valid_days=0, past_invalid_days=10, future_valid_days=20)
+    market = _market(["2024-01-02"])
+    long = _options("2024-01-02").iloc[0]
+    short = _options("2024-01-02").iloc[1]
+    from src.strategies import row_to_contract
+
+    long_contract = row_to_contract(long)
+    short_contract = row_to_contract(short)
+    result = _entry_time_feasibility_filter(long_contract, short_contract, options, _config(), _put_params())
+
+    assert result["filter_decision"] == "SKIP_EXIT_UNLIKELY"
+    assert result["no_lookahead_pass"] is True
+    assert pd.Timestamp(result["long_filter_max_reference_date"]) <= pd.Timestamp("2024-01-02")

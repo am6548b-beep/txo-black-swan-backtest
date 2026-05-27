@@ -24,7 +24,12 @@ from .strategies import BlackSwanStateMachine
 from .utils import year_key
 
 
-VARIANTS = ["current_signal_based", "quarterly_base_insurance", "base_plus_signal_boost"]
+VARIANTS = [
+    "current_signal_based",
+    "quarterly_base_insurance",
+    "base_plus_signal_boost",
+    "quarterly_base_insurance_feasible_only",
+]
 CRASH_WINDOWS: dict[str, tuple[str, str]] = {
     "2008": ("2008-01-01", "2008-12-31"),
     "2011": ("2011-01-01", "2011-12-31"),
@@ -42,6 +47,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         super().__init__(*args, **kwargs)
         self.variant_name = variant_name
         self.checked_quarters: set[str] = set()
+        self.feasibility_filter_events: list[dict[str, Any]] = []
 
     def _check_put_entry(self, row, stock_equity: float) -> None:
         if self.variant_name == "current_signal_based":
@@ -53,9 +59,12 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         if self.variant_name == "base_plus_signal_boost":
             self._check_quarterly_base(row, stock_equity, allow_signal_boost=True)
             return
+        if self.variant_name == "quarterly_base_insurance_feasible_only":
+            self._check_quarterly_base(row, stock_equity, allow_signal_boost=False, require_entry_time_feasible=True)
+            return
         raise ValueError(f"Unknown put-spread variant: {self.variant_name}")
 
-    def _check_quarterly_base(self, row, stock_equity: float, allow_signal_boost: bool) -> None:
+    def _check_quarterly_base(self, row, stock_equity: float, allow_signal_boost: bool, require_entry_time_feasible: bool = False) -> None:
         date = pd.Timestamp(row.date)
         quarter_key = f"{date.year}Q{date.quarter}"
         if quarter_key in self.checked_quarters:
@@ -76,7 +85,13 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         signal_ok = self._original_signal_ok(row)
         if allow_signal_boost and signal_ok:
             entry_budget = remaining
-        self._open_put_spread_with_budget(row, stock_equity, entry_budget, "quarterly_base_put_spread" if not signal_ok else "quarterly_signal_boost_put_spread")
+        self._open_put_spread_with_budget(
+            row,
+            stock_equity,
+            entry_budget,
+            "quarterly_base_put_spread" if not signal_ok else "quarterly_signal_boost_put_spread",
+            require_entry_time_feasible=require_entry_time_feasible,
+        )
 
     def _original_signal_ok(self, row) -> bool:
         if any(pd.isna(x) for x in [row.ma200, row.ret_126d, row.vix_percentile_3y]):
@@ -90,7 +105,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             and int(row.event_flag) == 0
         )
 
-    def _open_put_spread_with_budget(self, row, stock_equity: float, entry_budget: float, reason: str) -> None:
+    def _open_put_spread_with_budget(self, row, stock_equity: float, entry_budget: float, reason: str, require_entry_time_feasible: bool = False) -> None:
         if entry_budget <= 0:
             return
         macro_state = str(getattr(row, "macro_state", "NORMAL"))
@@ -114,6 +129,29 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         )
         if short_put is None or short_put.strike >= long_put.strike:
             return
+        if require_entry_time_feasible:
+            feasibility = _entry_time_feasibility_filter(long_put, short_put, self.options, self.config, self.put_params)
+            if feasibility["filter_decision"] == "SKIP_EXIT_UNLIKELY":
+                self.feasibility_filter_events.append(
+                    {
+                        "variant": self.variant_name,
+                        "date": str(date.date()),
+                        "long_put_strike": long_put.strike,
+                        "short_put_strike": short_put.strike,
+                        "long_put_moneyness": long_put.strike / float(row.txf_close),
+                        "short_put_moneyness": short_put.strike / float(row.txf_close),
+                        "expiry": long_put.expiry,
+                        "entry_dte": long_put.dte,
+                        "long_entry_time_feasibility": feasibility["long_entry_time_feasibility"],
+                        "short_entry_time_feasibility": feasibility["short_entry_time_feasibility"],
+                        "filter_decision": feasibility["filter_decision"],
+                        "skip_reason": feasibility["skip_reason"],
+                        "long_filter_max_reference_date": feasibility["long_filter_max_reference_date"],
+                        "short_filter_max_reference_date": feasibility["short_filter_max_reference_date"],
+                        "no_lookahead_pass": feasibility["no_lookahead_pass"],
+                    }
+                )
+                return
         stress = is_stress_day(row, self.config)
         long_px = fill_price(long_put, "BUY", self.config, stress)
         short_px = fill_price(short_put, "SELL", self.config, stress)
@@ -175,7 +213,15 @@ def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_
         engine = PutSpreadVariantStateMachine(market, options, portfolio, config, put_params, ic_params, mode="put_spread_only", variant_name=variant)
         equity, trades = engine.run()
         lifecycle = pd.DataFrame(equity.attrs.get("position_lifecycle_events", []))
-        variant_runs.append({"variant": variant, "equity": equity, "trades": trades, "lifecycle": lifecycle})
+        variant_runs.append(
+            {
+                "variant": variant,
+                "equity": equity,
+                "trades": trades,
+                "lifecycle": lifecycle,
+                "filter_events": pd.DataFrame(engine.feasibility_filter_events),
+            }
+        )
         rows.extend(_variant_summary_rows(variant, equity, trades, lifecycle, config))
         rows.extend(_annual_budget_rows(variant, equity, trades, config))
         rows.extend(_crash_rows(variant, equity, trades, lifecycle, market))
@@ -190,6 +236,9 @@ def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_
     feasibility = _entry_exit_feasibility_analysis(variant_runs, options, config, put_params)
     feasibility.to_csv(report_dir / "entry_exit_feasibility_analysis.csv", index=False)
     (report_dir / "entry_exit_feasibility_analysis.md").write_text(_feasibility_markdown(feasibility), encoding="utf-8")
+    filter_audit = _execution_feasibility_filter_audit(variant_runs, comparison, options, config, put_params)
+    filter_audit.to_csv(report_dir / "execution_feasibility_filter_audit.csv", index=False)
+    (report_dir / "execution_feasibility_filter_audit.md").write_text(_filter_audit_markdown(filter_audit), encoding="utf-8")
     return comparison
 
 
@@ -641,6 +690,97 @@ def _entry_exit_feasibility_analysis(
     return pd.DataFrame(rows)
 
 
+def _entry_time_feasibility_filter(long_contract: Any, short_contract: Any, options: pd.DataFrame, config: dict, put_params: dict) -> dict[str, Any]:
+    long_profile = _entry_time_leg_profile(long_contract, options, config, put_params)
+    short_profile = _entry_time_leg_profile(short_contract, options, config, put_params)
+    long_class = _feasibility_class(
+        long_profile["valid_quote_ratio"],
+        int(long_profile["tradable_days_count"]),
+        long_profile["median_open_interest_until_dte14"],
+        config,
+    )
+    short_class = _feasibility_class(
+        short_profile["valid_quote_ratio"],
+        int(short_profile["tradable_days_count"]),
+        short_profile["median_open_interest_until_dte14"],
+        config,
+    )
+    skip = long_class == "EXIT_UNLIKELY" or short_class == "EXIT_UNLIKELY"
+    entry_date = pd.Timestamp(long_contract.date)
+    max_dates = [pd.to_datetime(long_profile["max_reference_date"], errors="coerce"), pd.to_datetime(short_profile["max_reference_date"], errors="coerce")]
+    no_lookahead = all(pd.isna(date) or date <= entry_date for date in max_dates)
+    return {
+        "long_entry_time_feasibility": long_class,
+        "short_entry_time_feasibility": short_class,
+        "filter_decision": "SKIP_EXIT_UNLIKELY" if skip else "ALLOW",
+        "skip_reason": "EXIT_UNLIKELY_LEG" if skip else "",
+        "long_filter_max_reference_date": long_profile["max_reference_date"],
+        "short_filter_max_reference_date": short_profile["max_reference_date"],
+        "no_lookahead_pass": no_lookahead,
+        "long_profile": long_profile,
+        "short_profile": short_profile,
+    }
+
+
+def _entry_time_leg_profile(contract: Any, options: pd.DataFrame, config: dict, put_params: dict) -> dict[str, Any]:
+    entry_date = pd.Timestamp(contract.date)
+    lookback_start = entry_date - pd.Timedelta(days=int(config.get("entry_feasibility_lookback_days", 252)))
+    dte_min = int(put_params.get("target_dte_min", 60))
+    dte_max = int(put_params.get("target_dte_max", 120))
+    target_moneyness = float(contract.strike) / float(contract.underlying) if float(contract.underlying) else np.nan
+    hist = options[
+        (options["date"] >= lookback_start)
+        & (options["date"] <= entry_date)
+        & (options["cp"] == contract.cp)
+        & (options["dte"].between(dte_min, dte_max))
+        & options["underlying"].notna()
+    ].copy()
+    if hist.empty or pd.isna(target_moneyness):
+        return _empty_entry_time_profile(entry_date)
+    hist["moneyness"] = hist["strike"].astype(float) / hist["underlying"].astype(float)
+    bucket_width = float(config.get("entry_feasibility_moneyness_bucket_width", 0.025))
+    bucket = hist[(hist["moneyness"] - target_moneyness).abs() <= bucket_width].copy()
+    exact = hist[(hist["expiry"] == pd.Timestamp(contract.expiry)) & np.isclose(hist["strike"], float(contract.strike))].copy()
+    sample = pd.concat([bucket, exact], ignore_index=True).drop_duplicates(["date", "expiry", "cp", "strike"])
+    if sample.empty:
+        return _empty_entry_time_profile(entry_date)
+    valid = _valid_quote_mask(sample, config)
+    day_valid = valid.groupby(sample["date"]).any()
+    max_ref = sample["date"].max()
+    median_oi = _float_or_blank(pd.to_numeric(sample["open_interest"], errors="coerce").median())
+    return {
+        "tradable_days_count": int(day_valid.sum()),
+        "non_tradable_days_count": int((~day_valid).sum()),
+        "valid_quote_ratio": float(day_valid.mean()) if len(day_valid) else 0.0,
+        "first_non_valid_quote_date": "" if day_valid.all() else str(pd.Timestamp(day_valid[~day_valid].index.min()).date()),
+        "last_valid_quote_date": "" if not day_valid.any() else str(pd.Timestamp(day_valid[day_valid].index.max()).date()),
+        "days_from_last_valid_quote_to_expiry": "",
+        "average_spread_pct_until_dte14": _float_or_blank(pd.to_numeric(sample["spread_pct"], errors="coerce").mean()),
+        "median_volume_until_dte14": _float_or_blank(pd.to_numeric(sample["volume"], errors="coerce").median()),
+        "median_open_interest_until_dte14": 0.0 if median_oi == "" else median_oi,
+        "max_reference_date": "" if pd.isna(max_ref) else str(pd.Timestamp(max_ref).date()),
+        "sample_rows": int(len(sample)),
+        "unique_sample_days": int(sample["date"].nunique()),
+    }
+
+
+def _empty_entry_time_profile(entry_date: pd.Timestamp) -> dict[str, Any]:
+    return {
+        "tradable_days_count": 0,
+        "non_tradable_days_count": 0,
+        "valid_quote_ratio": 0.0,
+        "first_non_valid_quote_date": "",
+        "last_valid_quote_date": "",
+        "days_from_last_valid_quote_to_expiry": "",
+        "average_spread_pct_until_dte14": "",
+        "median_volume_until_dte14": "",
+        "median_open_interest_until_dte14": 0.0,
+        "max_reference_date": str(entry_date.date()),
+        "sample_rows": 0,
+        "unique_sample_days": 0,
+    }
+
+
 def _position_entry_exit_feasibility(pos: dict[str, Any], options: pd.DataFrame, config: dict, put_params: dict) -> dict[str, Any]:
     entry_date = pd.Timestamp(pos["entry_date"])
     expiry = pd.Timestamp(pos["expiry"])
@@ -873,6 +1013,186 @@ def _feasibility_markdown(analysis: pd.DataFrame) -> str:
             "- It does not recommend parameter changes.",
             "- It does not exclude trades or modify the selector.",
             "- It can indicate whether a future execution feasibility filter may be needed, but no filter is implemented here.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _execution_feasibility_filter_audit(
+    variant_runs: list[dict[str, Any]],
+    comparison: pd.DataFrame,
+    options: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    opt = options.copy()
+    opt["date"] = pd.to_datetime(opt["date"], errors="coerce")
+    opt["expiry"] = pd.to_datetime(opt["expiry"], errors="coerce")
+    d_run = next((run for run in variant_runs if run["variant"] == "quarterly_base_insurance_feasible_only"), None)
+    if d_run is None:
+        out = pd.DataFrame([{"section": "audit", "check": "variant_d_present", "status": "FAIL", "detail": "missing"}])
+        return out
+    events = d_run.get("filter_events", pd.DataFrame()).copy()
+    if events.empty:
+        events = pd.DataFrame(columns=["variant", "date", "filter_decision", "no_lookahead_pass"])
+    skipped = events[events.get("filter_decision", pd.Series(dtype=str)).astype(str) == "SKIP_EXIT_UNLIKELY"].copy()
+    rows.append(
+        {
+            "section": "filter_summary",
+            "variant": "quarterly_base_insurance_feasible_only",
+            "metric": "skipped_due_to_exit_unlikely",
+            "value": int(len(skipped)),
+        }
+    )
+    no_lookahead_fail = int((~events.get("no_lookahead_pass", pd.Series([True] * len(events))).astype(bool)).sum()) if not events.empty else 0
+    rows.append(
+        {
+            "section": "audit",
+            "variant": "quarterly_base_insurance_feasible_only",
+            "check": "no_lookahead_check",
+            "status": "FAIL" if no_lookahead_fail else "PASS",
+            "detail": f"fail_rows={no_lookahead_fail}",
+        }
+    )
+    for event in skipped.itertuples(index=False):
+        pseudo_pos = {
+            "variant": getattr(event, "variant", "quarterly_base_insurance_feasible_only"),
+            "position_id": f"SKIPPED-{getattr(event, 'Index', '')}",
+            "entry_date": getattr(event, "date"),
+            "expiry": getattr(event, "expiry"),
+            "entry_dte": getattr(event, "entry_dte", ""),
+            "long_put_strike": float(getattr(event, "long_put_strike")),
+            "short_put_strike": float(getattr(event, "short_put_strike")),
+            "long_put_moneyness": getattr(event, "long_put_moneyness", ""),
+            "short_put_moneyness": getattr(event, "short_put_moneyness", ""),
+            "quantity": "",
+            "net_premium_paid": "",
+            "forced_unfilled_exit": "",
+            "normal_exit": "",
+        }
+        diag = _position_entry_exit_feasibility(pseudo_pos, opt, config, put_params)
+        rows.append(
+            {
+                "section": "skipped_candidate",
+                "variant": getattr(event, "variant", "quarterly_base_insurance_feasible_only"),
+                "date": getattr(event, "date"),
+                "expiry": getattr(event, "expiry"),
+                "entry_dte": getattr(event, "entry_dte", ""),
+                "long_put_strike": getattr(event, "long_put_strike"),
+                "short_put_strike": getattr(event, "short_put_strike"),
+                "long_put_moneyness": getattr(event, "long_put_moneyness", ""),
+                "short_put_moneyness": getattr(event, "short_put_moneyness", ""),
+                "long_entry_time_feasibility": getattr(event, "long_entry_time_feasibility"),
+                "short_entry_time_feasibility": getattr(event, "short_entry_time_feasibility"),
+                "filter_decision": getattr(event, "filter_decision"),
+                "skip_reason": getattr(event, "skip_reason"),
+                "diagnostic_feasibility": diag["feasibility_class"],
+                "skipped_candidate_later_forced_exit_proxy": bool(diag["feasibility_class"] != "EXIT_FEASIBLE"),
+                "no_lookahead_pass": getattr(event, "no_lookahead_pass"),
+                "long_filter_max_reference_date": getattr(event, "long_filter_max_reference_date"),
+                "short_filter_max_reference_date": getattr(event, "short_filter_max_reference_date"),
+            }
+        )
+    rows.extend(_variant_d_audit_rows(d_run, comparison))
+    return pd.DataFrame(rows)
+
+
+def _variant_d_audit_rows(run: dict[str, Any], comparison: pd.DataFrame) -> list[dict[str, Any]]:
+    variant = "quarterly_base_insurance_feasible_only"
+    trades = run["trades"]
+    lifecycle = run["lifecycle"]
+    forced_count = int((lifecycle.get("issue", pd.Series(dtype=str)).astype(str) == "forced_unfilled_exit").sum()) if not lifecycle.empty else 0
+    status = trades.get("quote_quality_status", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str) if not trades.empty else pd.Series(dtype=str)
+    non_valid = int((status != "VALID").sum()) if not status.empty else 0
+    annual = comparison[(comparison["section"] == "annual_budget_usage") & (comparison["variant"] == variant)]
+    crash = comparison[(comparison["section"] == "crash_window") & (comparison["variant"] == variant)]
+    rows: list[dict[str, Any]] = [
+        {"section": "variant_d_summary", "variant": variant, "metric": "forced_unfilled_exit_count", "value": forced_count},
+        {"section": "variant_d_summary", "variant": variant, "metric": "non_valid_quote_trades_count", "value": non_valid},
+    ]
+    for row in annual.itertuples(index=False):
+        rows.append(
+            {
+                "section": "variant_d_annual_hedge_cost",
+                "variant": variant,
+                "year": row.year,
+                "annual_hedge_cost": row.annual_hedge_cost,
+                "annual_budget_breach": row.annual_budget_breach,
+            }
+        )
+    for row in crash.itertuples(index=False):
+        rows.append(
+            {
+                "section": "variant_d_crash_coverage",
+                "variant": variant,
+                "period": row.period,
+                "crash_window_coverage_ratio": row.crash_window_coverage_ratio,
+                "crash_window_coverage_days": row.crash_window_coverage_days,
+            }
+        )
+    return rows
+
+
+def _filter_audit_markdown(audit: pd.DataFrame) -> str:
+    summary = audit[audit["section"] == "filter_summary"] if not audit.empty else pd.DataFrame()
+    skipped = audit[audit["section"] == "skipped_candidate"] if not audit.empty else pd.DataFrame()
+    no_lookahead = audit[(audit["section"] == "audit") & (audit.get("check", pd.Series(dtype=str)) == "no_lookahead_check")] if not audit.empty else pd.DataFrame()
+    d_summary = audit[audit["section"] == "variant_d_summary"] if not audit.empty else pd.DataFrame()
+    crash = audit[audit["section"] == "variant_d_crash_coverage"] if not audit.empty else pd.DataFrame()
+    annual = audit[audit["section"] == "variant_d_annual_hedge_cost"] if not audit.empty else pd.DataFrame()
+    lines = [
+        "# Execution Feasibility Filter Audit",
+        "",
+        "This report audits Variant D only. The filter excludes EXIT_UNLIKELY candidates using entry-date and prior data only.",
+        "",
+        "## Filter Summary",
+        "",
+    ]
+    if summary.empty:
+        lines.append("- skipped_due_to_exit_unlikely: 0")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(f"- {row.metric}: {row.value}")
+    if not no_lookahead.empty:
+        for row in no_lookahead.itertuples(index=False):
+            lines.append(f"- no_lookahead_check: {row.status} ({row.detail})")
+    lines.extend(["", "## Skipped Candidates", ""])
+    if skipped.empty:
+        lines.append("- None.")
+    else:
+        for row in skipped.itertuples(index=False):
+            lines.append(
+                f"- {row.date} {row.expiry}: long={row.long_put_strike}, short={row.short_put_strike}, "
+                f"entry_time=({row.long_entry_time_feasibility}/{row.short_entry_time_feasibility}), "
+                f"diagnostic={row.diagnostic_feasibility}, later_forced_proxy={row.skipped_candidate_later_forced_exit_proxy}"
+            )
+    lines.extend(["", "## Variant D Summary", ""])
+    if d_summary.empty:
+        lines.append("- Unavailable.")
+    else:
+        for row in d_summary.itertuples(index=False):
+            lines.append(f"- {row.metric}: {row.value}")
+    lines.extend(["", "## Variant D Crash Coverage", ""])
+    if crash.empty:
+        lines.append("- Unavailable.")
+    else:
+        for row in crash.itertuples(index=False):
+            lines.append(f"- {row.period}: ratio={row.crash_window_coverage_ratio}, days={row.crash_window_coverage_days}")
+    lines.extend(["", "## Variant D Annual Hedge Cost", ""])
+    if annual.empty:
+        lines.append("- None.")
+    else:
+        for row in annual.itertuples(index=False):
+            lines.append(f"- {int(float(row.year))}: cost={row.annual_hedge_cost}, budget_breach={row.annual_budget_breach}")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This filter audit does not recommend parameters or rank variants.",
+            "- Variant D excludes only EXIT_UNLIKELY candidates; EXIT_FRAGILE candidates remain allowed.",
+            "- The entry-time filter uses historical quote/liquidity profile only; diagnostic fields may inspect later paths for audit labels.",
         ]
     )
     return "\n".join(lines) + "\n"
