@@ -109,6 +109,9 @@ def main() -> None:
     raw_inventory = build_raw_options_file_inventory(raw_dir / "taifex" / "opt", options)
     raw_inventory.to_csv(report_dir / "raw_options_file_inventory.csv", index=False)
     write_raw_options_inventory_markdown(report_dir / "raw_options_file_inventory.md", raw_inventory)
+    recognition_debug = build_raw_options_file_recognition_debug(raw_dir / "taifex" / "opt", options)
+    recognition_debug.to_csv(report_dir / "raw_options_file_recognition_debug.csv", index=False)
+    write_raw_options_recognition_debug_markdown(report_dir / "raw_options_file_recognition_debug.md", recognition_debug)
     write_audit_markdown(report_dir / "data_cleaning_audit.md", audit_df, market, options)
 
     counts = audit_df["status"].value_counts().to_dict() if not audit_df.empty else {}
@@ -121,6 +124,8 @@ def main() -> None:
     print(f"wrote {report_dir / 'data_cleaning_audit.md'}")
     print(f"wrote {report_dir / 'raw_options_file_inventory.csv'}")
     print(f"wrote {report_dir / 'raw_options_file_inventory.md'}")
+    print(f"wrote {report_dir / 'raw_options_file_recognition_debug.csv'}")
+    print(f"wrote {report_dir / 'raw_options_file_recognition_debug.md'}")
     print(f"bad expiry rows: {debug_counts['bad_expiry_rows']}")
     print(f"bad bid/ask rows: {debug_counts['bad_bid_ask_rows']}")
     print(f"extreme spread sample rows: {debug_counts['extreme_spread_rows_sample']}")
@@ -512,6 +517,35 @@ def raw_options_file_inventory_row(path: Path) -> dict[str, object]:
         "sample_first_date": "",
         "sample_last_date": "",
     }
+    if path.suffix.lower() in {".csv", ".txt", ""}:
+        sample, encoding, error = read_csv_with_detected_encoding(path, nrows=500)
+        base["detected_encoding"] = encoding
+        if error:
+            base["normalization_error"] = f"read_failed: {error}"
+            return base
+        sample = normalize_columns(sample)
+        base["detected_columns"] = ";".join(map(str, sample.columns.tolist()))
+        date_candidates = detect_date_columns(sample)
+        contract_cols = detect_contract_columns(sample)
+        if not date_candidates:
+            base["normalization_error"] = "missing_date_column"
+            base["row_count"] = delimited_row_count(path, encoding)
+            return base
+        counts = delimited_date_and_txo_counts(path, encoding, date_candidates[0], contract_cols[0] if contract_cols else None)
+        base["row_count"] = int(counts.get("row_count_raw", 0))
+        base["option_rows_count"] = int(counts.get("txo_rows_detected", base["row_count"]))
+        base["date_min"] = counts.get("parsed_date_min", "")
+        base["date_max"] = counts.get("parsed_date_max", "")
+        base["year_min"] = counts.get("parsed_year_min", np.nan)
+        base["year_max"] = counts.get("parsed_year_max", np.nan)
+        base["raw_rows_2020"] = int(counts.get("raw_rows_2020", 0))
+        base["has_2020_rows"] = bool(counts.get("has_2020_rows", False))
+        base["sample_first_date"] = base["date_min"]
+        base["sample_last_date"] = base["date_max"]
+        normalizable, reason = prepare_real_data_normalizable_status(path, sample)
+        base["normalized_success"] = bool(normalizable)
+        base["normalization_error"] = "" if normalizable else reason
+        return base
     df, encoding, error = read_csv_with_detected_encoding(path)
     base["detected_encoding"] = encoding
     if error:
@@ -689,6 +723,438 @@ def write_raw_options_inventory_markdown(path: Path, inventory: pd.DataFrame) ->
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+
+def build_raw_options_file_recognition_debug(opt_dir: Path, processed_options: pd.DataFrame) -> pd.DataFrame:
+    files = [path for path in sorted(opt_dir.rglob("*")) if path.is_file()] if opt_dir.exists() else []
+    rows = [raw_options_file_recognition_row(path) for path in files]
+    rows.extend(raw_options_recognition_summary(rows, processed_options))
+    return pd.DataFrame(rows)
+
+
+def raw_options_file_recognition_row(path: Path) -> dict[str, object]:
+    extension = path.suffix.lower()
+    first_text, detected_encoding = read_first_text(path)
+    row: dict[str, object] = {
+        "section": "raw_file_recognition",
+        "source_file": path.name,
+        "full_path": str(path.resolve()),
+        "extension": extension if extension else "(none)",
+        "file_size": path.stat().st_size if path.exists() else 0,
+        "first_300_chars": first_text[:300].replace("\r", " ").replace("\n", " "),
+        "detected_encoding": detected_encoding,
+        "detected_format": "UNKNOWN",
+        "detected_columns": "",
+        "row_count_raw": 0,
+        "date_column_candidates": "",
+        "first_20_date_values": "",
+        "parsed_date_min": "",
+        "parsed_date_max": "",
+        "parsed_year_min": np.nan,
+        "parsed_year_max": np.nan,
+        "roc_year_detected": False,
+        "western_year_detected": False,
+        "has_2018_rows": False,
+        "has_2019_rows": False,
+        "has_2020_rows": False,
+        "has_2021_rows": False,
+        "has_2022_rows": False,
+        "has_2023_rows": False,
+        "has_2024_rows": False,
+        "has_2018_2024_rows": False,
+        "raw_rows_2018": 0,
+        "raw_rows_2019": 0,
+        "raw_rows_2020": 0,
+        "raw_rows_2021": 0,
+        "raw_rows_2022": 0,
+        "raw_rows_2023": 0,
+        "raw_rows_2024": 0,
+        "contract_column_detected": False,
+        "cp_column_detected": False,
+        "strike_column_detected": False,
+        "txo_rows_detected": 0,
+        "normalizable_by_prepare_real_data": False,
+        "skip_reason": "UNKNOWN",
+    }
+    if int(row["file_size"]) == 0:
+        row["skip_reason"] = "EMPTY_FILE"
+        return row
+    if extension in {".csv", ".txt", ""} and not looks_like_html(first_text):
+        return raw_delimited_file_recognition_row(path, row)
+    df, detected_format, error = read_tabular_for_recognition(path)
+    row["detected_format"] = detected_format
+    if error:
+        row["skip_reason"] = error
+        return row
+    if df.empty:
+        row["skip_reason"] = "EMPTY_FILE"
+        return row
+    df = normalize_columns(df)
+    row["detected_columns"] = ";".join(map(str, df.columns.tolist()))
+    row["row_count_raw"] = int(len(df))
+    date_candidates = detect_date_columns(df)
+    row["date_column_candidates"] = ";".join(date_candidates)
+    parsed_dates = pd.Series(dtype="datetime64[ns]")
+    first_values: list[str] = []
+    for col in date_candidates:
+        values = df[col].dropna().astype(str)
+        if not first_values:
+            first_values = values.head(20).tolist()
+        parsed_dates = pd.concat([parsed_dates, parse_mixed_taifex_dates(values).dropna()], ignore_index=True)
+        row["roc_year_detected"] = bool(row["roc_year_detected"]) or detect_roc_year(values)
+        row["western_year_detected"] = bool(row["western_year_detected"]) or detect_western_year(values)
+    row["first_20_date_values"] = ";".join(first_values)
+    if parsed_dates.empty:
+        row["skip_reason"] = "NO_DATE_COLUMN" if not date_candidates else "DATE_PARSE_GAP"
+        return row
+    row["parsed_date_min"] = str(parsed_dates.min().date())
+    row["parsed_date_max"] = str(parsed_dates.max().date())
+    row["parsed_year_min"] = int(parsed_dates.min().year)
+    row["parsed_year_max"] = int(parsed_dates.max().year)
+    for year in range(2018, 2025):
+        count = int((parsed_dates.dt.year == year).sum())
+        row[f"raw_rows_{year}"] = count
+        row[f"has_{year}_rows"] = bool(count)
+    row["has_2018_2024_rows"] = any(bool(row[f"has_{year}_rows"]) for year in range(2018, 2025))
+    contract_cols = detect_contract_columns(df)
+    cp_cols = detect_cp_columns(df)
+    strike_cols = detect_strike_columns(df)
+    row["contract_column_detected"] = bool(contract_cols)
+    row["cp_column_detected"] = bool(cp_cols)
+    row["strike_column_detected"] = bool(strike_cols)
+    row["txo_rows_detected"] = count_txo_rows(df, contract_cols)
+    normalizable, reason = prepare_real_data_normalizable_status(path, df)
+    row["normalizable_by_prepare_real_data"] = bool(normalizable)
+    if normalizable:
+        row["skip_reason"] = "OK_RECOGNIZED"
+    elif not contract_cols:
+        row["skip_reason"] = "TXO_COLUMN_PARSE_GAP"
+    elif int(row["txo_rows_detected"]) == 0:
+        row["skip_reason"] = "NO_TXO_ROWS"
+    elif not cp_cols or not strike_cols:
+        row["skip_reason"] = "COLUMN_MAPPING_GAP"
+    else:
+        row["skip_reason"] = reason or "COLUMN_MAPPING_GAP"
+    return row
+
+
+def raw_delimited_file_recognition_row(path: Path, row: dict[str, object]) -> dict[str, object]:
+    sample, encoding, error = read_csv_with_detected_encoding(path, nrows=500)
+    row["detected_encoding"] = encoding or row.get("detected_encoding", "")
+    row["detected_format"] = "CSV"
+    if error:
+        row["skip_reason"] = "ENCODING_FAILED"
+        return row
+    sample = normalize_columns(sample)
+    row["detected_columns"] = ";".join(map(str, sample.columns.tolist()))
+    date_candidates = detect_date_columns(sample)
+    contract_cols = detect_contract_columns(sample)
+    cp_cols = detect_cp_columns(sample)
+    strike_cols = detect_strike_columns(sample)
+    row["date_column_candidates"] = ";".join(date_candidates)
+    row["contract_column_detected"] = bool(contract_cols)
+    row["cp_column_detected"] = bool(cp_cols)
+    row["strike_column_detected"] = bool(strike_cols)
+    if date_candidates:
+        first_values = sample[date_candidates[0]].dropna().astype(str).head(20)
+        row["first_20_date_values"] = ";".join(first_values.tolist())
+        row["roc_year_detected"] = detect_roc_year(first_values)
+        row["western_year_detected"] = detect_western_year(first_values)
+    if not date_candidates:
+        row["skip_reason"] = "NO_DATE_COLUMN"
+        row["row_count_raw"] = delimited_row_count(path, encoding)
+        return row
+    row.update(delimited_date_and_txo_counts(path, encoding, date_candidates[0], contract_cols[0] if contract_cols else None))
+    normalizable, reason = prepare_real_data_normalizable_status(path, sample)
+    row["normalizable_by_prepare_real_data"] = bool(normalizable)
+    if normalizable:
+        row["skip_reason"] = "OK_RECOGNIZED"
+    elif not contract_cols:
+        row["skip_reason"] = "TXO_COLUMN_PARSE_GAP"
+    elif int(row["txo_rows_detected"]) == 0:
+        row["skip_reason"] = "NO_TXO_ROWS"
+    elif not cp_cols or not strike_cols:
+        row["skip_reason"] = "COLUMN_MAPPING_GAP"
+    else:
+        row["skip_reason"] = reason or "COLUMN_MAPPING_GAP"
+    return row
+
+
+def delimited_row_count(path: Path, encoding: str) -> int:
+    try:
+        with path.open("r", encoding=encoding or "utf-8-sig", errors="ignore") as handle:
+            return max(0, sum(1 for _ in handle) - 1)
+    except Exception:
+        return 0
+
+
+def delimited_date_and_txo_counts(path: Path, encoding: str, date_col: str, contract_col: str | None) -> dict[str, object]:
+    row_count = delimited_row_count(path, encoding)
+    txo_count = 0
+    parsed_dates: list[pd.Timestamp] = []
+    try:
+        with path.open("r", encoding=encoding or "utf-8-sig", errors="ignore") as handle:
+            header_line = handle.readline()
+            header = [part.replace("\ufeff", "").strip() for part in header_line.strip().split(",")]
+            date_idx = header.index(date_col)
+            contract_idx = header.index(contract_col) if contract_col and contract_col in header else None
+            sample_lines = []
+            for _, line in zip(range(2000), handle):
+                sample_lines.append(line)
+            tail_lines = tail_text_lines(path, encoding, 2000)
+            sampled = sample_lines + tail_lines
+            for line in sampled:
+                parts = line.rstrip("\n\r").split(",")
+                if date_idx < len(parts):
+                    parsed = parse_mixed_taifex_date_value(parts[date_idx])
+                    if pd.notna(parsed):
+                        parsed_dates.append(parsed)
+                if contract_idx is not None and contract_idx < len(parts) and parts[contract_idx].strip().upper() == "TXO":
+                    txo_count += 1
+    except Exception:
+        return {"row_count_raw": row_count, "skip_reason": "DATE_PARSE_GAP"}
+    out: dict[str, object] = {"row_count_raw": int(row_count), "txo_rows_detected": int(txo_count)}
+    if not parsed_dates:
+        out["skip_reason"] = "DATE_PARSE_GAP"
+        return out
+    parsed_series = pd.Series(parsed_dates)
+    out["parsed_date_min"] = str(parsed_series.min().date())
+    out["parsed_date_max"] = str(parsed_series.max().date())
+    out["parsed_year_min"] = int(parsed_series.min().year)
+    out["parsed_year_max"] = int(parsed_series.max().year)
+    for year in range(2018, 2025):
+        if int(parsed_series.min().year) == int(parsed_series.max().year) == year:
+            count = int(row_count)
+        else:
+            count = int((parsed_series.dt.year == year).sum())
+        out[f"raw_rows_{year}"] = count
+        out[f"has_{year}_rows"] = bool(count)
+    out["has_2018_2024_rows"] = any(bool(out[f"has_{year}_rows"]) for year in range(2018, 2025))
+    return out
+
+
+def tail_text_lines(path: Path, encoding: str, n: int) -> list[str]:
+    try:
+        with path.open("r", encoding=encoding or "utf-8-sig", errors="ignore") as handle:
+            from collections import deque
+
+            return list(deque(handle, maxlen=n))
+    except Exception:
+        return []
+
+
+def read_first_text(path: Path, size: int = 4096) -> tuple[str, str]:
+    raw = path.read_bytes()[:size]
+    for encoding in ENCODINGS:
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "binary_or_unknown"
+
+
+def read_tabular_for_recognition(path: Path) -> tuple[pd.DataFrame, str, str]:
+    ext = path.suffix.lower()
+    text, _ = read_first_text(path, size=500_000)
+    if ext in {".csv", ".txt", ""}:
+        if looks_like_html(text):
+            tables = read_html_tables_for_recognition(text)
+            return (tables[0], "EXCEL_HTML", "") if tables else (pd.DataFrame(), "HTML", "HTML_NOT_CSV")
+        df, _, error = read_csv_with_detected_encoding(path)
+        return (df, "CSV", "") if not error else (pd.DataFrame(), "UNKNOWN", "ENCODING_FAILED")
+    if ext in {".htm", ".html"}:
+        tables = read_html_tables_for_recognition(text)
+        return (tables[0], "HTML", "") if tables else (pd.DataFrame(), "HTML", "HTML_NOT_CSV")
+    if ext in {".xls", ".xlsx"}:
+        try:
+            return pd.read_excel(path), "EXCEL", ""
+        except Exception:
+            if looks_like_html(text):
+                tables = read_html_tables_for_recognition(text)
+                return (tables[0], "EXCEL_HTML", "") if tables else (pd.DataFrame(), "EXCEL_HTML", "HTML_NOT_CSV")
+            return pd.DataFrame(), "EXCEL", "UNSUPPORTED_EXTENSION"
+    return pd.DataFrame(), "UNKNOWN", "UNSUPPORTED_EXTENSION"
+
+
+def looks_like_html(text: str) -> bool:
+    sample = text[:500].lower()
+    return "<html" in sample or "<table" in sample or "<!doctype html" in sample
+
+
+def read_html_tables_for_recognition(text: str) -> list[pd.DataFrame]:
+    try:
+        return pd.read_html(text)
+    except Exception:
+        return []
+
+
+def detect_date_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for col in df.columns:
+        name = str(col).lower()
+        values = df[col].dropna().astype(str).head(100)
+        parsed = parse_mixed_taifex_dates(values)
+        if any(token in name for token in ["date", "日期", "交易日", "交?"]) or parsed.notna().sum() >= max(3, min(10, len(values)) // 2):
+            cols.append(str(col))
+    return cols
+
+
+def parse_mixed_taifex_dates(values: pd.Series) -> pd.Series:
+    return values.apply(parse_mixed_taifex_date_value)
+
+
+def parse_mixed_taifex_date_value(value: object) -> pd.Timestamp | pd.NaT:
+    text = str(value).strip().strip('"')
+    if not text or text.lower() == "nan":
+        return pd.NaT
+    match = re.fullmatch(r"(\d{2,4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if match:
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        if 80 <= year <= 150:
+            year += 1911
+        return safe_timestamp(year, month, day)
+    match = re.fullmatch(r"(\d{7,8})", text)
+    if match:
+        digits = match.group(1)
+        year = int(digits[:3]) + 1911 if len(digits) == 7 else int(digits[:4])
+        month = int(digits[-4:-2])
+        day = int(digits[-2:])
+        return safe_timestamp(year, month, day)
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed) or parsed.year < 1900 or parsed.year > 2100:
+        return pd.NaT
+    return parsed
+
+
+def safe_timestamp(year: int, month: int, day: int) -> pd.Timestamp | pd.NaT:
+    if year < 1900 or year > 2100:
+        return pd.NaT
+    try:
+        return pd.Timestamp(year=year, month=month, day=day)
+    except ValueError:
+        return pd.NaT
+
+
+def detect_roc_year(values: pd.Series) -> bool:
+    return values.astype(str).str.match(r"^\s*(10[7-9]|11[0-3])([/-]|\d{4})").any()
+
+
+def detect_western_year(values: pd.Series) -> bool:
+    return values.astype(str).str.match(r"^\s*20(18|19|20|21|22|23|24)([/-]|\d{4})").any()
+
+
+def detect_contract_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for col in df.columns:
+        name = str(col).lower()
+        values = df[col].dropna().astype(str).str.upper().head(500)
+        if any(token in name for token in ["contract", "契約", "憟"]) or values.eq("TXO").any():
+            cols.append(str(col))
+    return cols
+
+
+def detect_cp_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for col in df.columns:
+        name = str(col).lower()
+        values = df[col].dropna().astype(str).str.upper().head(500)
+        if any(token in name for token in ["買賣權", "cp", "call", "put"]) or values.isin(["C", "P", "CALL", "PUT"]).any() or values.str.contains("買權|賣權|CALL|PUT", regex=True).any():
+            cols.append(str(col))
+    return cols
+
+
+def detect_strike_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for col in df.columns:
+        name = str(col).lower()
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if any(token in name for token in ["履約", "strike", "撅"]) or numeric.between(1000, 50000).sum() >= max(3, min(20, len(df)) // 2):
+            cols.append(str(col))
+    return cols
+
+
+def count_txo_rows(df: pd.DataFrame, contract_cols: list[str]) -> int:
+    if not contract_cols:
+        return 0
+    mask = pd.Series(False, index=df.index)
+    for col in contract_cols:
+        mask |= df[col].astype(str).str.strip().str.upper().eq("TXO")
+    return int(mask.sum())
+
+
+def prepare_real_data_normalizable_status(path: Path, df: pd.DataFrame) -> tuple[bool, str]:
+    if path.suffix.lower() != ".csv":
+        return False, "UNSUPPORTED_EXTENSION"
+    date_col = first_col(df, ["鈭斗??交?", "?交?"])
+    contract_col = first_col(df, ["憟?"])
+    if date_col is None or contract_col is None:
+        return False, "COLUMN_MAPPING_GAP"
+    txo = df[df[contract_col].astype(str).str.strip().eq("TXO")]
+    if txo.empty:
+        return False, "NO_TXO_ROWS"
+    if parse_date(txo[date_col]).dropna().empty:
+        return False, "DATE_PARSE_GAP"
+    return True, ""
+
+
+def raw_options_recognition_summary(raw_rows: list[dict[str, object]], processed_options: pd.DataFrame) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    raw = pd.DataFrame(raw_rows)
+    processed = processed_options.copy()
+    if "date" in processed:
+        processed["date"] = pd.to_datetime(processed["date"], errors="coerce")
+    processed_counts = processed["date"].dt.year.value_counts().sort_index() if "date" in processed and not processed.empty else pd.Series(dtype=int)
+    rows.append({"section": "aggregate_summary", "metric": "raw_files_count", "value": int(len(raw))})
+    if raw.empty:
+        for year in range(2018, 2025):
+            processed_count = int(processed_counts.get(year, 0))
+            status = "RAW_DATA_MISSING" if processed_count == 0 else "COVERED"
+            rows.append({"section": "aggregate_summary", "metric": "year_coverage_status", "year": year, "raw_rows": 0, "processed_rows": processed_count, "coverage_status": status})
+        return rows
+    rows.append({"section": "aggregate_summary", "metric": "files_with_2018_2024_rows", "value": int(raw["has_2018_2024_rows"].fillna(False).astype(bool).sum())})
+    rows.append({"section": "aggregate_summary", "metric": "files_with_2020_rows", "value": int(raw["has_2020_rows"].fillna(False).astype(bool).sum())})
+    for ext, count in raw["extension"].fillna("(none)").astype(str).value_counts().items():
+        rows.append({"section": "aggregate_summary", "metric": "extension_distribution", "extension": ext, "count": int(count)})
+    for reason, count in raw["skip_reason"].fillna("UNKNOWN").astype(str).value_counts().items():
+        rows.append({"section": "aggregate_summary", "metric": "skip_reason_distribution", "skip_reason": reason, "count": int(count)})
+    for year in range(2018, 2025):
+        raw_count = int(pd.to_numeric(raw.get(f"raw_rows_{year}", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        processed_count = int(processed_counts.get(year, 0))
+        status = "INGESTION_RECOGNITION_GAP" if raw_count > 0 and processed_count == 0 else "RAW_DATA_MISSING" if raw_count == 0 else "COVERED"
+        rows.append({"section": "aggregate_summary", "metric": "year_coverage_status", "year": year, "raw_rows": raw_count, "processed_rows": processed_count, "coverage_status": status})
+    gap_files = raw[raw["has_2018_2024_rows"].fillna(False).astype(bool) & ~raw["normalizable_by_prepare_real_data"].fillna(False).astype(bool)]
+    if not gap_files.empty:
+        top_reason = gap_files["skip_reason"].fillna("UNKNOWN").astype(str).value_counts().idxmax()
+        rows.append({"section": "aggregate_summary", "metric": "most_likely_prepare_real_data_gap_reason", "skip_reason": top_reason, "count": int((gap_files["skip_reason"].astype(str) == top_reason).sum())})
+    return rows
+
+
+def write_raw_options_recognition_debug_markdown(path: Path, debug: pd.DataFrame) -> None:
+    raw = debug[debug["section"] == "raw_file_recognition"] if not debug.empty and "section" in debug else pd.DataFrame()
+    agg = debug[debug["section"] == "aggregate_summary"] if not debug.empty and "section" in debug else pd.DataFrame()
+    lines = ["# Raw Options File Recognition Debug", "", "This report recursively scans raw option files for recognition gaps. It does not modify raw data, processed data, parsers, formulas, strategies, or trades.", "", "## Summary", ""]
+    for metric in ["raw_files_count", "files_with_2018_2024_rows", "files_with_2020_rows"]:
+        item = agg[agg.get("metric", pd.Series(dtype=str)) == metric] if not agg.empty else pd.DataFrame()
+        lines.append(f"- {metric}: {item.iloc[0].get('value', '') if not item.empty else ''}")
+    lines.extend(["", "## Skip Reason Distribution", ""])
+    for row in agg[agg.get("metric", pd.Series(dtype=str)) == "skip_reason_distribution"].itertuples(index=False) if not agg.empty else []:
+        lines.append(f"- {row.skip_reason}: {row.count}")
+    lines.extend(["", "## Year Coverage Status", ""])
+    for row in agg[agg.get("metric", pd.Series(dtype=str)) == "year_coverage_status"].itertuples(index=False) if not agg.empty else []:
+        lines.append(f"- {row.year}: raw_rows={row.raw_rows}, processed_rows={row.processed_rows}, status={row.coverage_status}")
+    gap = agg[agg.get("metric", pd.Series(dtype=str)) == "most_likely_prepare_real_data_gap_reason"] if not agg.empty else pd.DataFrame()
+    if not gap.empty:
+        row = gap.iloc[0]
+        lines.extend(["", "## Most Likely Recognition Gap", "", f"- {row.get('skip_reason')}: {row.get('count')} files"])
+    files_2020 = raw[raw.get("has_2020_rows", pd.Series(dtype=bool)).fillna(False).astype(bool)] if not raw.empty else pd.DataFrame()
+    lines.extend(["", "## Files With 2020 Rows", ""])
+    if files_2020.empty:
+        lines.append("- none")
+    else:
+        for row in files_2020.head(100).itertuples(index=False):
+            lines.append(f"- {row.source_file}: skip_reason={row.skip_reason}, parsed_range={row.parsed_date_min}..{row.parsed_date_max}")
+    lines.extend(["", "## Required Limitations", "", "- This debug report does not download data.", "- It does not fill or repair missing data.", "- It does not change parser behavior.", "- It does not run a backtest."])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:

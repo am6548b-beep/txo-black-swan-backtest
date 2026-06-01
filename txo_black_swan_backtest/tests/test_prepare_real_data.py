@@ -212,3 +212,59 @@ def test_raw_options_inventory_report_has_no_best_or_recommend(tmp_path) -> None
 
     assert "best" not in text
     assert "recommend" not in text
+
+
+def test_recognition_debug_recurses_and_parses_roc_dates(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    nested = opt_dir / "nested"
+    nested.mkdir(parents=True)
+    (nested / "roc_2020.txt").write_text(
+        "交易日期,契約,履約價,買賣權\n109/01/02,TXO,10000,買權\n109/03/02,TXO,10000,賣權\n",
+        encoding="utf-8-sig",
+    )
+
+    debug = module.build_raw_options_file_recognition_debug(opt_dir, pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])}))
+    raw = debug[debug["section"] == "raw_file_recognition"].iloc[0]
+
+    assert raw["parsed_date_min"] == "2020-01-02"
+    assert bool(raw["roc_year_detected"])
+    assert bool(raw["has_2020_rows"])
+
+
+def test_recognition_debug_marks_ingestion_recognition_gap(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "western_2020.csv").write_text(
+        "交易日期,契約,履約價,買賣權\n2020-01-02,TXO,10000,買權\n",
+        encoding="utf-8-sig",
+    )
+
+    debug = module.build_raw_options_file_recognition_debug(opt_dir, pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])}))
+    status = debug[(debug["section"] == "aggregate_summary") & (debug["metric"] == "year_coverage_status") & (debug["year"] == 2020)].iloc[0]
+
+    assert status["coverage_status"] == "INGESTION_RECOGNITION_GAP"
+
+
+def test_recognition_debug_marks_raw_data_missing(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+
+    debug = module.build_raw_options_file_recognition_debug(opt_dir, pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])}))
+    status = debug[(debug["section"] == "aggregate_summary") & (debug["metric"] == "year_coverage_status") & (debug["year"] == 2020)].iloc[0]
+
+    assert status["coverage_status"] == "RAW_DATA_MISSING"
+
+
+def test_recognition_debug_report_has_no_best_or_recommend(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    path = tmp_path / "recognition.md"
+    frame = pd.DataFrame([{"section": "aggregate_summary", "metric": "raw_files_count", "value": 0}])
+
+    module.write_raw_options_recognition_debug_markdown(path, frame)
+    text = path.read_text(encoding="utf-8").lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
