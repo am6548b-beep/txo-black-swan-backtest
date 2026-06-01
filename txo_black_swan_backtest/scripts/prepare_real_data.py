@@ -106,6 +106,9 @@ def main() -> None:
     audit_df.to_csv(report_dir / "data_cleaning_audit.csv", index=False)
     debug_counts = write_debug_outputs(report_dir, options)
     write_quote_quality_reports(report_dir, options)
+    raw_inventory = build_raw_options_file_inventory(raw_dir / "taifex" / "opt", options)
+    raw_inventory.to_csv(report_dir / "raw_options_file_inventory.csv", index=False)
+    write_raw_options_inventory_markdown(report_dir / "raw_options_file_inventory.md", raw_inventory)
     write_audit_markdown(report_dir / "data_cleaning_audit.md", audit_df, market, options)
 
     counts = audit_df["status"].value_counts().to_dict() if not audit_df.empty else {}
@@ -116,6 +119,8 @@ def main() -> None:
     print(f"wrote {out_dir / 'options.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.md'}")
+    print(f"wrote {report_dir / 'raw_options_file_inventory.csv'}")
+    print(f"wrote {report_dir / 'raw_options_file_inventory.md'}")
     print(f"bad expiry rows: {debug_counts['bad_expiry_rows']}")
     print(f"bad bid/ask rows: {debug_counts['bad_bid_ask_rows']}")
     print(f"extreme spread sample rows: {debug_counts['extreme_spread_rows_sample']}")
@@ -463,6 +468,227 @@ def read_csv_with_encoding(path: Path) -> pd.DataFrame:
     if last_exc is not None:
         raise last_exc
     return pd.DataFrame()
+
+
+def read_csv_with_detected_encoding(path: Path, nrows: int | None = None) -> tuple[pd.DataFrame, str, str]:
+    last_exc: Exception | None = None
+    for encoding in ENCODINGS:
+        try:
+            return pd.read_csv(path, encoding=encoding, low_memory=False, nrows=nrows), encoding, ""
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            return pd.DataFrame(), encoding, str(exc)
+    return pd.DataFrame(), "", str(last_exc) if last_exc else "unknown read error"
+
+
+def build_raw_options_file_inventory(opt_dir: Path, processed_options: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    files = sorted(opt_dir.glob("*.csv")) if opt_dir.exists() else []
+    for path in files:
+        rows.append(raw_options_file_inventory_row(path))
+    rows.extend(raw_options_inventory_summary(rows, processed_options))
+    return pd.DataFrame(rows)
+
+
+def raw_options_file_inventory_row(path: Path) -> dict[str, object]:
+    base: dict[str, object] = {
+        "section": "raw_file",
+        "source_file": path.name,
+        "file_size": path.stat().st_size if path.exists() else 0,
+        "detected_encoding": "",
+        "detected_columns": "",
+        "row_count": 0,
+        "date_min": "",
+        "date_max": "",
+        "year_min": np.nan,
+        "year_max": np.nan,
+        "has_2020_rows": False,
+        "raw_rows_2020": 0,
+        "option_rows_count": 0,
+        "normalized_success": False,
+        "normalization_error": "",
+        "sample_first_date": "",
+        "sample_last_date": "",
+    }
+    df, encoding, error = read_csv_with_detected_encoding(path)
+    base["detected_encoding"] = encoding
+    if error:
+        base["normalization_error"] = f"read_failed: {error}"
+        return base
+    df = normalize_columns(df)
+    base["detected_columns"] = ";".join(map(str, df.columns.tolist()))
+    base["row_count"] = int(len(df))
+    if df.empty:
+        base["normalization_error"] = "empty_file"
+        return base
+    date_col = first_col(df, ["交易日期", "日期", "Date", "date", "鈭斗??交?", "?交?"])
+    contract_col = first_col(df, ["契約", "contract", "Contract", "憟?"])
+    if date_col is None:
+        base["normalization_error"] = "missing_date_column"
+        return base
+    work = df.copy()
+    if contract_col is not None:
+        contract = work[contract_col].astype(str).str.strip().str.upper()
+        work = work[contract.eq("TXO")]
+        if work.empty:
+            base["normalization_error"] = "no_txo_rows"
+            return base
+    dates = parse_date(work[date_col]).dropna()
+    base["option_rows_count"] = int(len(work))
+    if dates.empty:
+        base["normalization_error"] = "unparseable_dates"
+        return base
+    date_min = dates.min()
+    date_max = dates.max()
+    base["date_min"] = str(date_min.date())
+    base["date_max"] = str(date_max.date())
+    base["year_min"] = int(date_min.year)
+    base["year_max"] = int(date_max.year)
+    base["raw_rows_2020"] = int((dates.dt.year == 2020).sum())
+    base["has_2020_rows"] = bool(base["raw_rows_2020"])
+    base["sample_first_date"] = str(dates.iloc[0].date())
+    base["sample_last_date"] = str(dates.iloc[-1].date())
+    base["normalized_success"] = True
+    base["normalization_error"] = ""
+    return base
+
+
+def raw_options_inventory_summary(raw_rows: list[dict[str, object]], processed_options: pd.DataFrame) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    raw = pd.DataFrame(raw_rows)
+    processed = processed_options.copy()
+    if "date" in processed:
+        processed["date"] = pd.to_datetime(processed["date"], errors="coerce")
+    raw_files_count = int(len(raw))
+    raw_2020_files = int(raw.get("has_2020_rows", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not raw.empty else 0
+    raw_2020_rows = int(pd.to_numeric(raw.get("raw_rows_2020", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not raw.empty else 0
+    processed_year_counts = (
+        processed["date"].dt.year.value_counts().sort_index()
+        if "date" in processed and not processed.empty
+        else pd.Series(dtype=int)
+    )
+    processed_2020_rows = int(processed_year_counts.get(2020, 0))
+    status_2020 = "COVERED"
+    if raw_2020_rows > 0 and processed_2020_rows == 0:
+        status_2020 = "INGESTION_GAP"
+    elif raw_2020_rows == 0:
+        status_2020 = "RAW_DATA_MISSING"
+    rows.append(
+        {
+            "section": "aggregate_summary",
+            "metric": "raw_file_coverage",
+            "raw_files_count": raw_files_count,
+            "raw_files_covering_2020": raw_2020_files,
+            "raw_rows_covering_2020": raw_2020_rows,
+            "processed_2020_rows": processed_2020_rows,
+            "coverage_status_2020": status_2020,
+        }
+    )
+    if "date" in processed and processed["date"].notna().any():
+        rows.append(
+            {
+                "section": "aggregate_summary",
+                "metric": "processed_options_date_range",
+                "date_min": str(processed["date"].min().date()),
+                "date_max": str(processed["date"].max().date()),
+            }
+        )
+    for year in range(2001, 2026):
+        rows.append(
+            {
+                "section": "aggregate_summary",
+                "metric": "processed_options_rows_by_year",
+                "year": year,
+                "processed_options_rows": int(processed_year_counts.get(year, 0)),
+            }
+        )
+    processed_years = {int(year) for year, count in processed_year_counts.items() if int(count) > 0}
+    raw_years = raw_year_set(raw)
+    missing_years = [year for year in range(2001, 2026) if year not in processed_years]
+    raw_without_processed = sorted(year for year in raw_years if 2001 <= year <= 2025 and year not in processed_years)
+    low_row_years = [int(year) for year, count in processed_year_counts.items() if 2001 <= int(year) <= 2025 and int(count) < 1000]
+    rows.extend(
+        [
+            {"section": "aggregate_summary", "metric": "missing_years_2001_2025", "years": ";".join(map(str, missing_years))},
+            {"section": "aggregate_summary", "metric": "years_with_raw_data_but_no_processed_data", "years": ";".join(map(str, raw_without_processed))},
+            {"section": "aggregate_summary", "metric": "years_with_processed_data_but_low_row_count", "years": ";".join(map(str, low_row_years))},
+        ]
+    )
+    if not raw.empty:
+        skipped = raw[~raw["normalized_success"].fillna(False).astype(bool)]
+        for row in skipped.itertuples(index=False):
+            rows.append(
+                {
+                    "section": "aggregate_summary",
+                    "metric": "source_file_skipped_by_prepare_real_data",
+                    "source_file": getattr(row, "source_file", ""),
+                    "normalization_error": getattr(row, "normalization_error", ""),
+                }
+            )
+    return rows
+
+
+def raw_year_set(raw: pd.DataFrame) -> set[int]:
+    years: set[int] = set()
+    if raw.empty:
+        return years
+    for row in raw.itertuples(index=False):
+        if not bool(getattr(row, "normalized_success", False)):
+            continue
+        y0 = getattr(row, "year_min", np.nan)
+        y1 = getattr(row, "year_max", np.nan)
+        if pd.isna(y0) or pd.isna(y1):
+            continue
+        years.update(range(int(y0), int(y1) + 1))
+    return years
+
+
+def write_raw_options_inventory_markdown(path: Path, inventory: pd.DataFrame) -> None:
+    aggregate = inventory[inventory["section"] == "aggregate_summary"] if not inventory.empty and "section" in inventory else pd.DataFrame()
+    raw_files = inventory[inventory["section"] == "raw_file"] if not inventory.empty and "section" in inventory else pd.DataFrame()
+    coverage = aggregate[aggregate.get("metric", pd.Series(dtype=str)) == "raw_file_coverage"] if not aggregate.empty else pd.DataFrame()
+    lines = [
+        "# Raw Options File Inventory",
+        "",
+        "This report audits raw TXO option file coverage and ingestion coverage only. It does not modify raw data, processed data, parsers, prices, formulas, or trades.",
+        "",
+        "## Summary",
+        "",
+    ]
+    if coverage.empty:
+        lines.append("- No coverage summary.")
+    else:
+        row = coverage.iloc[0]
+        lines.append(f"- raw files count: {row.get('raw_files_count')}")
+        lines.append(f"- raw files covering 2020: {row.get('raw_files_covering_2020')}")
+        lines.append(f"- raw rows covering 2020: {row.get('raw_rows_covering_2020')}")
+        lines.append(f"- processed 2020 rows: {row.get('processed_2020_rows')}")
+        lines.append(f"- 2020 coverage status: {row.get('coverage_status_2020')}")
+    lines.extend(["", "## Skipped Raw Files", ""])
+    skipped = raw_files[~raw_files.get("normalized_success", pd.Series(dtype=bool)).fillna(False).astype(bool)] if not raw_files.empty else pd.DataFrame()
+    if skipped.empty:
+        lines.append("- none")
+    else:
+        for row in skipped.head(50).itertuples(index=False):
+            lines.append(f"- {row.source_file}: {row.normalization_error}")
+    missing = aggregate[aggregate.get("metric", pd.Series(dtype=str)) == "missing_years_2001_2025"] if not aggregate.empty else pd.DataFrame()
+    if not missing.empty:
+        lines.extend(["", "## Missing Years", "", f"- {missing.iloc[0].get('years', '')}"])
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This inventory does not fill missing data.",
+            "- It does not relax quote quality requirements.",
+            "- It does not change ingestion logic.",
+            "- It does not run a backtest.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:

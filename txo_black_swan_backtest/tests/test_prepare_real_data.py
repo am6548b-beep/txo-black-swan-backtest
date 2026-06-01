@@ -140,3 +140,75 @@ def test_is_tradable_quote_only_valid() -> None:
         "EXTREME_SPREAD_FAIL",
         "EXTREME_SPREAD_WARN",
     ]
+
+
+def test_raw_options_inventory_handles_empty_raw_folder(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    processed = pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])})
+
+    inventory = module.build_raw_options_file_inventory(opt_dir, processed)
+    coverage = inventory[inventory["metric"] == "raw_file_coverage"].iloc[0]
+
+    assert int(coverage["raw_files_count"]) == 0
+    assert coverage["coverage_status_2020"] == "RAW_DATA_MISSING"
+
+
+def test_raw_options_inventory_detects_file_date_range(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "txo_2020.csv").write_text(
+        "交易日期,契約,履約價,買賣權\n2020-01-02,TXO,10000,買權\n2020-12-31,TXO,10000,賣權\n",
+        encoding="utf-8-sig",
+    )
+
+    inventory = module.build_raw_options_file_inventory(opt_dir, pd.DataFrame({"date": pd.to_datetime(["2020-01-02"])}))
+    raw = inventory[inventory["section"] == "raw_file"].iloc[0]
+
+    assert raw["date_min"] == "2020-01-02"
+    assert raw["date_max"] == "2020-12-31"
+    assert bool(raw["has_2020_rows"])
+
+
+def test_raw_options_inventory_marks_raw_data_missing(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "txo_2019.csv").write_text(
+        "交易日期,契約,履約價,買賣權\n2019-01-02,TXO,10000,買權\n",
+        encoding="utf-8-sig",
+    )
+
+    inventory = module.build_raw_options_file_inventory(opt_dir, pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])}))
+    coverage = inventory[inventory["metric"] == "raw_file_coverage"].iloc[0]
+
+    assert coverage["coverage_status_2020"] == "RAW_DATA_MISSING"
+
+
+def test_raw_options_inventory_marks_ingestion_gap(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "txo_2020.csv").write_text(
+        "交易日期,契約,履約價,買賣權\n2020-01-02,TXO,10000,買權\n",
+        encoding="utf-8-sig",
+    )
+    processed = pd.DataFrame({"date": pd.to_datetime(["2019-01-02"])})
+
+    inventory = module.build_raw_options_file_inventory(opt_dir, processed)
+    coverage = inventory[inventory["metric"] == "raw_file_coverage"].iloc[0]
+
+    assert coverage["coverage_status_2020"] == "INGESTION_GAP"
+
+
+def test_raw_options_inventory_report_has_no_best_or_recommend(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    path = tmp_path / "dummy.md"
+    text_frame = pd.DataFrame([{"section": "aggregate_summary", "metric": "raw_file_coverage", "coverage_status_2020": "RAW_DATA_MISSING"}])
+    module.write_raw_options_inventory_markdown(path, text_frame)
+    text = path.read_text(encoding="utf-8").lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
