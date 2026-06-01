@@ -1,0 +1,78 @@
+sources:
+  - source_name: taifex_txo_volatility_index
+    provider: TAIFEX
+    url: https://openapi.taifex.com.tw/
+    api_endpoint: https://openapi.taifex.com.tw/v1/TaiwanVIX
+    license_url: http://data.gov.tw/license
+    frequency: daily
+    fields:
+      - date
+      - tw_vix
+    status: planned
+    notes: Official TXO volatility index endpoint name must be verified from TAIFEX OpenAPI. Downloader records failure without proxy filling if unavailable.
+
+  - source_name: taifex_put_call_ratio
+    provider: TAIFEX
+    url: https://openapi.taifex.com.tw/
+    api_endpoint: https://openapi.taifex.com.tw/v1/PutCallRatio
+    license_url: http://data.gov.tw/license
+    frequency: daily
+    fields:
+      - date
+      - put_call_volume_ratio
+      - put_call_oi_ratio
+    status: implemented
+    notes: TAIFEX OpenAPI PutCallRatio. Column names are normalized conservatively and failures are audited.
+
+  - source_name: taifex_major_institutional_traders_futures_options
+    provider: TAIFEX
+    url: https://openapi.taifex.com.tw/
+    api_endpoint: https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDividedByFuturesAndOptionsBytheDate
+    license_url: http://data.gov.tw/license
+    frequency: daily
+    fields:
+      - date
+      - foreign_futures_net_position
+    status: planned
+    notes: Planned for foreign futures net positioning. First downloader version preserves empty column if parser cannot normalize fields safely.
+
+  - source_name: twse_valuation_by_date
+    provider: TWSE
+    url: https://openapi.twse.com.tw/
+    api_endpoint: https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d
+    license_url: http://data.gov.tw/license
+    frequency: daily
+    fields:
+      - date
+      - twse_pe
+      - twse_pb
+      - twse_dividend_yield
+    status: implemented
+    notes: TWSE OpenAPI valuation endpoint by date. First version aggregates numeric listed-stock rows by date with median values when available.
+
+  - source_name: taifex_daily_foreign_exchange_rates
+    provider: TAIFEX
+    url: https://openapi.taifex.com.tw/
+    api_endpoint: https://openapi.taifex.com.tw/v1/DailyForeignExchangeRates
+    license_url: http://data.gov.tw/license
+    frequency: daily
+    fields:
+      - date
+      - usdtwd
+    status: planned
+    notes: Planned official FX support. First version records failure or leaves usdtwd empty if fields cannot be normalized safely.
+
+  - source_name: fred_macro_rates_inflation
+    provider: FRED
+    url: https://fred.stlouisfed.org/
+    api_endpoint: ""
+    license_url: https://fred.stlouisfed.org/legal/
+    frequency: monthly/daily
+    fields:
+      - dxy
+      - us10y
+      - us2y
+      - cpi_yoy
+      - core_cpi_yoy
+    status: planned
+    notes: Not implemented in first version. Use only if official FRED access is configured without paid data.

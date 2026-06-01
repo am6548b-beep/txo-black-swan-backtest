@@ -32,6 +32,7 @@ reports/*.svg
 data/**
 
 !data/
+!data/risk_sources.yml
 !data/raw/
 !data/raw/taifex/
 !data/raw/macro/

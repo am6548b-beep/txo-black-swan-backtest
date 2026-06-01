@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.hedge_need import (
+    apply_risk_indicators_to_market,
     hedge_coverage_timeline,
     hedge_gap_audit,
     hedge_need_score_frame,
@@ -12,6 +13,7 @@ from src.hedge_need import (
     _attribution_markdown,
     _markdown,
 )
+from src.risk_indicator_downloader import read_source_registry, _combine_frames, _audit_markdown
 
 
 def test_target_hedge_coverage_mapping() -> None:
@@ -192,3 +194,54 @@ def test_crash_attribution_uses_existing_scores_only() -> None:
 
     assert not crash.empty
     assert float(crash.iloc[0]["score_change"]) == 0.0
+
+
+def test_risk_source_registry_readable() -> None:
+    sources = read_source_registry(__import__("pathlib").Path("data/risk_sources.yml"))
+
+    assert sources
+    assert any(source.source_name == "taifex_put_call_ratio" for source in sources)
+
+
+def test_risk_indicators_missing_columns_do_not_crash() -> None:
+    frame = _combine_frames([pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "tw_vix": [20.0]})], "2024-01-01", "2024-01-31")
+
+    assert "put_call_volume_ratio" in frame.columns
+    assert pd.isna(frame.loc[0, "put_call_volume_ratio"])
+
+
+def test_tw_vix_available_disables_vix_proxy_for_matching_dates() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "vix": [12.0], "vix_is_proxy": [True]})
+    risk = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "tw_vix": [22.0]})
+    merged = apply_risk_indicators_to_market(market, risk)
+
+    assert merged.loc[0, "vix"] == 22.0
+    assert not bool(merged.loc[0, "vix_is_proxy"])
+
+
+def test_tw_vix_missing_keeps_vix_proxy() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "vix": [12.0], "vix_is_proxy": [True]})
+    risk = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "tw_vix": [pd.NA]})
+    merged = apply_risk_indicators_to_market(market, risk)
+
+    assert merged.loc[0, "vix"] == 12.0
+    assert bool(merged.loc[0, "vix_is_proxy"])
+
+
+def test_risk_indicator_integration_does_not_change_weights() -> None:
+    assert RISK_WEIGHTS == {
+        "ValuationRisk": 0.20,
+        "VolatilityComplacencyRisk": 0.20,
+        "MacroDemandFragility": 0.15,
+        "SupplyStressIndex": 0.15,
+        "LiquidityStress": 0.10,
+        "TrendFragility": 0.20,
+    }
+
+
+def test_failed_download_audit_does_not_imply_fill() -> None:
+    audit = pd.DataFrame([{"source_name": "x", "status": "failed", "row_count": 0, "detail": "network"}])
+    text = _audit_markdown(audit).lower()
+
+    assert "failed" in text
+    assert "no mock values" in text

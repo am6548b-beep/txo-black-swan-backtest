@@ -55,6 +55,7 @@ def write_hedge_need_diagnostics(
         (report_dir / "hedge_need_score.md").write_text(_markdown(empty, empty), encoding="utf-8")
         return empty, empty, empty
 
+    market = apply_risk_indicators_to_market(market, load_risk_indicators(data_dir))
     market = add_market_indicators(market)
     market = add_macro_regime_indicators(market, load_macro_factors(data_dir))
     portfolio = load_portfolio(data_dir, market, config)
@@ -92,7 +93,8 @@ def hedge_need_score_frame(market: pd.DataFrame) -> pd.DataFrame:
     out["TrendFragility"] = _trend_fragility(out)
     out["HedgeNeedScore"] = sum(out[col] * weight for col, weight in RISK_WEIGHTS.items()).clip(0, 100)
     out["target_hedge_coverage"] = out["HedgeNeedScore"].map(target_hedge_coverage)
-    out["vix_proxy_in_use"] = bool(out.get("vix_is_proxy", pd.Series([False])).any())
+    vix_proxy = out.get("vix_is_proxy", pd.Series(False, index=out.index))
+    out["vix_proxy_in_use"] = vix_proxy.astype(bool).values if isinstance(vix_proxy, pd.Series) else bool(vix_proxy)
     return out[
         [
             "date",
@@ -107,6 +109,38 @@ def hedge_need_score_frame(market: pd.DataFrame) -> pd.DataFrame:
             "vix_proxy_in_use",
         ]
     ]
+
+
+def load_risk_indicators(data_dir: Path) -> pd.DataFrame:
+    path = data_dir / "risk_indicators.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path, parse_dates=["date"])
+
+
+def apply_risk_indicators_to_market(market: pd.DataFrame, risk: pd.DataFrame) -> pd.DataFrame:
+    """Overlay official risk indicators when available, without filling missing data."""
+
+    if risk.empty or "date" not in risk.columns:
+        return market
+    out = market.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    risk = risk.copy()
+    risk["date"] = pd.to_datetime(risk["date"], errors="coerce")
+    use_cols = [col for col in ["date", "tw_vix", "tw_vix_is_proxy", "cpi_yoy", "core_cpi_yoy", "us10y", "us2y", "dxy"] if col in risk.columns]
+    merged = out.merge(risk[use_cols], on="date", how="left", suffixes=("", "_risk"))
+    if "tw_vix" in merged.columns:
+        merged["tw_vix"] = pd.to_numeric(merged["tw_vix"], errors="coerce")
+        has_tw_vix = merged["tw_vix"].notna().astype(bool)
+        merged.loc[has_tw_vix, "vix"] = merged.loc[has_tw_vix, "tw_vix"]
+        if "vix_is_proxy" not in merged.columns:
+            merged["vix_is_proxy"] = True
+        merged.loc[has_tw_vix, "vix_is_proxy"] = False
+        merged.loc[~has_tw_vix, "vix_is_proxy"] = merged.loc[~has_tw_vix, "vix_is_proxy"].fillna(True)
+    for col in ["cpi_yoy", "core_cpi_yoy"]:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
+    return merged
 
 
 def target_hedge_coverage(score: float) -> float:
