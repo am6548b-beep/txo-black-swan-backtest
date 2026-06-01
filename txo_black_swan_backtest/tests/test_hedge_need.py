@@ -17,6 +17,11 @@ from src.hedge_need import (
 )
 from src.risk_indicator_downloader import read_source_registry, _combine_frames, _audit_markdown
 from src.risk_indicator_builder import build_local_risk_indicator_frame, _audit_markdown as _local_audit_markdown
+from src.risk_indicator_builder import (
+    classify_local_proxy_root_cause,
+    local_txo_proxy_missing_root_cause,
+    _root_cause_markdown,
+)
 
 
 def test_target_hedge_coverage_mapping() -> None:
@@ -575,3 +580,75 @@ def test_volatility_proxy_audit_does_not_create_trade_rows() -> None:
 
     assert "strategy" not in audit.columns
     assert "action" not in audit.columns
+
+
+def test_local_proxy_root_cause_missing_options_rows() -> None:
+    row = {
+        "market_row_exists": True,
+        "txf_close_valid": True,
+        "options_rows_count": 0,
+    }
+
+    assert classify_local_proxy_root_cause(row) == "NO_OPTIONS_ROWS"
+
+
+def test_local_proxy_root_cause_no_dte_20_45() -> None:
+    row = {
+        "market_row_exists": True,
+        "txf_close_valid": True,
+        "options_rows_count": 10,
+        "tradable_options_count": 10,
+        "dte_20_45_count": 0,
+    }
+
+    assert classify_local_proxy_root_cause(row) == "NO_DTE_20_45"
+
+
+def test_local_proxy_root_cause_non_valid_atm_leg() -> None:
+    row = {
+        "market_row_exists": True,
+        "txf_close_valid": True,
+        "options_rows_count": 10,
+        "tradable_options_count": 8,
+        "dte_20_45_count": 6,
+        "dte_20_45_tradable_count": 4,
+        "atm_call_candidate_exists": True,
+        "atm_put_candidate_exists": True,
+        "atm_call_valid": False,
+        "atm_put_valid": True,
+    }
+
+    assert classify_local_proxy_root_cause(row) == "NON_VALID_ATM_CALL"
+
+
+def test_local_proxy_root_cause_audit_does_not_modify_inputs() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2020-01-02"]), "txf_close": [10000.0]})
+    options = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-02", "2020-01-02"]),
+            "expiry": pd.to_datetime(["2020-02-05", "2020-02-05"]),
+            "dte": [34, 34],
+            "cp": ["P", "C"],
+            "strike": [10000.0, 10000.0],
+            "bid": [10.0, 12.0],
+            "ask": [11.0, 13.0],
+            "volume": [100, 100],
+            "open_interest": [100, 100],
+            "quote_quality_status": ["VALID", "VALID"],
+            "is_tradable_quote": [True, True],
+        }
+    )
+    market_before = market.copy(deep=True)
+    options_before = options.copy(deep=True)
+
+    local_txo_proxy_missing_root_cause(market, options)
+
+    pd.testing.assert_frame_equal(market, market_before)
+    pd.testing.assert_frame_equal(options, options_before)
+
+
+def test_local_proxy_root_cause_report_has_no_best_or_recommend() -> None:
+    text = _root_cause_markdown(pd.DataFrame()).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
