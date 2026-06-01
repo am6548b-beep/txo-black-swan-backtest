@@ -8,10 +8,12 @@ from src.hedge_need import (
     hedge_gap_audit,
     hedge_need_score_frame,
     hedge_need_score_attribution,
+    volatility_proxy_coverage_audit,
     target_hedge_coverage,
     RISK_WEIGHTS,
     _attribution_markdown,
     _markdown,
+    _volatility_proxy_markdown,
 )
 from src.risk_indicator_downloader import read_source_registry, _combine_frames, _audit_markdown
 from src.risk_indicator_builder import build_local_risk_indicator_frame, _audit_markdown as _local_audit_markdown
@@ -464,3 +466,112 @@ def test_local_risk_indicator_report_has_no_best_or_recommend() -> None:
 
     assert "best" not in text
     assert "recommend" not in text
+
+
+def test_volatility_proxy_audit_does_not_modify_score_frame() -> None:
+    dates = pd.date_range("2019-07-01", periods=220, freq="D")
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "tx_close": [100.0 + i * 0.01 for i in range(len(dates))],
+            "ma200": [100.0] * len(dates),
+            "ret_126d": [0.0] * len(dates),
+            "drawdown_20d_from_high": [0.0] * len(dates),
+            "vix_percentile_3y": [50.0] * len(dates),
+            "ValuationRiskIndex": [50.0] * len(dates),
+            "MacroDemandFragilityIndex": [0.0] * len(dates),
+            "SupplyStressIndex": [0.0] * len(dates),
+            "LiquidityStressIndex": [50.0] * len(dates),
+            "vix_is_proxy": [False] * len(dates),
+            "atm_straddle_premium_ratio_30d": [0.05] * len(dates),
+        }
+    )
+    score = hedge_need_score_frame(market)
+    before = score.copy(deep=True)
+
+    volatility_proxy_coverage_audit(score, market)
+
+    pd.testing.assert_frame_equal(score, before)
+
+
+def test_volatility_proxy_audit_local_proxy_available_flag() -> None:
+    dates = pd.date_range("2019-07-01", periods=220, freq="D")
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "tx_close": [100.0] * len(dates),
+            "ma200": [100.0] * len(dates),
+            "ret_126d": [0.0] * len(dates),
+            "drawdown_20d_from_high": [0.0] * len(dates),
+            "vix_percentile_3y": [50.0] * len(dates),
+            "ValuationRiskIndex": [50.0] * len(dates),
+            "MacroDemandFragilityIndex": [0.0] * len(dates),
+            "SupplyStressIndex": [0.0] * len(dates),
+            "LiquidityStressIndex": [50.0] * len(dates),
+            "vix_is_proxy": [False] * len(dates),
+            "put_skew_proxy_30d": [pd.NA] * 40 + [1.2] * (len(dates) - 40),
+        }
+    )
+    score = hedge_need_score_frame(market)
+    audit = volatility_proxy_coverage_audit(score, market)
+    daily = audit[(audit["section"] == "daily_proxy_coverage") & (audit["crash_label"] == "2020")]
+
+    assert daily["local_proxy_available"].astype(bool).any()
+    assert set(daily.loc[daily["local_proxy_available"].astype(bool), "volatility_source_type"]) == {"LOCAL_TXO_PROXY"}
+
+
+def test_volatility_proxy_audit_fallback_realized_vol_flag() -> None:
+    dates = pd.date_range("2019-07-01", periods=220, freq="D")
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "tx_close": [100.0 + i for i in range(len(dates))],
+            "ma200": [100.0] * len(dates),
+            "ret_126d": [0.0] * len(dates),
+            "drawdown_20d_from_high": [0.0] * len(dates),
+            "vix": [20.0] * len(dates),
+            "vix_percentile_3y": [50.0] * len(dates),
+            "ValuationRiskIndex": [50.0] * len(dates),
+            "MacroDemandFragilityIndex": [0.0] * len(dates),
+            "SupplyStressIndex": [0.0] * len(dates),
+            "LiquidityStressIndex": [50.0] * len(dates),
+            "vix_is_proxy": [True] * len(dates),
+        }
+    )
+    score = hedge_need_score_frame(market)
+    audit = volatility_proxy_coverage_audit(score, market)
+    daily = audit[(audit["section"] == "daily_proxy_coverage") & audit["date"].notna()]
+
+    assert daily["fallback_realized_vol_used"].astype(bool).all()
+    assert set(daily["volatility_source_type"]) == {"REALIZED_VOL_PROXY"}
+
+
+def test_volatility_proxy_report_has_no_best_or_recommend() -> None:
+    text = _volatility_proxy_markdown(pd.DataFrame()).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
+
+
+def test_volatility_proxy_audit_does_not_create_trade_rows() -> None:
+    dates = pd.date_range("2019-07-01", periods=220, freq="D")
+    market = pd.DataFrame(
+        {
+            "date": dates,
+            "tx_close": [100.0] * len(dates),
+            "ma200": [100.0] * len(dates),
+            "ret_126d": [0.0] * len(dates),
+            "drawdown_20d_from_high": [0.0] * len(dates),
+            "vix_percentile_3y": [50.0] * len(dates),
+            "ValuationRiskIndex": [50.0] * len(dates),
+            "MacroDemandFragilityIndex": [0.0] * len(dates),
+            "SupplyStressIndex": [0.0] * len(dates),
+            "LiquidityStressIndex": [50.0] * len(dates),
+            "vix_is_proxy": [False] * len(dates),
+        }
+    )
+    score = hedge_need_score_frame(market)
+    audit = volatility_proxy_coverage_audit(score, market)
+
+    assert "strategy" not in audit.columns
+    assert "action" not in audit.columns

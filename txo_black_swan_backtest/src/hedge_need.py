@@ -69,13 +69,16 @@ def write_hedge_need_diagnostics(
     coverage = _append_budget_and_attempt_flags(coverage, trades, config)
     audit = hedge_gap_audit(coverage, options, config, put_params)
     attribution = hedge_need_score_attribution(score, market)
+    volatility_audit = volatility_proxy_coverage_audit(score, market)
 
     score.to_csv(report_dir / "hedge_need_score.csv", index=False)
     coverage.to_csv(report_dir / "hedge_coverage_timeline.csv", index=False)
     audit.to_csv(report_dir / "hedge_gap_audit.csv", index=False)
     attribution.to_csv(report_dir / "hedge_need_score_attribution.csv", index=False)
+    volatility_audit.to_csv(report_dir / "volatility_proxy_coverage_audit.csv", index=False)
     (report_dir / "hedge_need_score.md").write_text(_markdown(score, audit), encoding="utf-8")
     (report_dir / "hedge_need_score_attribution.md").write_text(_attribution_markdown(attribution), encoding="utf-8")
+    (report_dir / "volatility_proxy_coverage_audit.md").write_text(_volatility_proxy_markdown(volatility_audit), encoding="utf-8")
     return score, coverage, audit
 
 
@@ -291,6 +294,192 @@ def hedge_need_score_attribution(score: pd.DataFrame, market: pd.DataFrame) -> p
         }
     )
     return pd.DataFrame(rows)
+
+
+def volatility_proxy_coverage_audit(score: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """Audit 2008/2020 volatility proxy coverage without changing scores or trades."""
+
+    daily = _volatility_proxy_daily_rows(score, market)
+    rows: list[dict[str, Any]] = daily.to_dict("records")
+    rows.extend(_volatility_proxy_summary_rows(daily))
+    rows.extend(_volatility_proxy_comparison_rows(daily))
+    rows.append(
+        {
+            "section": "overfitting_controls",
+            "status": "PASS",
+            "detail": "volatility proxy audit reads existing scores and fixed proxy columns only; no formula, weight, target, or trade changes",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def _volatility_proxy_daily_rows(score: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    score_cols = [
+        "date",
+        "HedgeNeedScore",
+        "VolatilityComplacencyRisk",
+        "TrendFragility",
+        "volatility_source_type",
+    ]
+    available_score_cols = [col for col in score_cols if col in score.columns]
+    work = score[available_score_cols].copy() if available_score_cols else pd.DataFrame()
+    if work.empty or "date" not in work.columns:
+        return pd.DataFrame()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    market_cols = [
+        "date",
+        "tx_close",
+        "atm_straddle_premium_ratio_30d",
+        "put_skew_proxy_30d",
+        "iv_term_structure_proxy",
+        "put_call_volume_ratio_tradable",
+        "score_confidence",
+    ]
+    if "date" in market.columns:
+        m = market[[col for col in market_cols if col in market.columns]].copy()
+        m["date"] = pd.to_datetime(m["date"], errors="coerce")
+        work = work.merge(m, on="date", how="left", suffixes=("", "_market"))
+    if "score_confidence" not in work.columns:
+        attribution = _daily_attribution(score, market)
+        work = work.merge(attribution[["date", "score_confidence"]], on="date", how="left")
+    close = pd.to_numeric(work.get("tx_close", pd.Series(np.nan, index=work.index)), errors="coerce")
+    work["realized_vol_20d"] = close.pct_change().rolling(20, min_periods=20).std() * np.sqrt(252) * 100
+    local_cols = ["atm_straddle_premium_ratio_30d", "put_skew_proxy_30d", "iv_term_structure_proxy", "put_call_volume_ratio_tradable"]
+    local_available = pd.Series(False, index=work.index)
+    for col in local_cols:
+        if col in work.columns:
+            local_available |= pd.to_numeric(work[col], errors="coerce").notna()
+        else:
+            work[col] = np.nan
+    if "volatility_source_type" not in work.columns:
+        work["volatility_source_type"] = "MISSING"
+    work["local_proxy_available"] = local_available
+    work["fallback_realized_vol_used"] = work["volatility_source_type"].astype(str).eq("REALIZED_VOL_PROXY")
+    work["missing_volatility"] = work["volatility_source_type"].astype(str).eq("MISSING")
+    rows = []
+    for label in ["2008", "2020"]:
+        start = pd.Timestamp(CRASH_WINDOWS[label][0])
+        pre = work[(work["date"] >= start - pd.Timedelta(days=180)) & (work["date"] < start)].copy()
+        if pre.empty:
+            rows.append({"section": "daily_proxy_coverage", "crash_label": label, "status": "WARN", "detail": "no pre-window rows"})
+            continue
+        pre["section"] = "daily_proxy_coverage"
+        pre["crash_label"] = label
+        rows.extend(
+            pre[
+                [
+                    "section",
+                    "date",
+                    "crash_label",
+                    "HedgeNeedScore",
+                    "VolatilityComplacencyRisk",
+                    "TrendFragility",
+                    "volatility_source_type",
+                    "atm_straddle_premium_ratio_30d",
+                    "put_skew_proxy_30d",
+                    "iv_term_structure_proxy",
+                    "put_call_volume_ratio_tradable",
+                    "realized_vol_20d",
+                    "score_confidence",
+                    "local_proxy_available",
+                    "fallback_realized_vol_used",
+                    "missing_volatility",
+                ]
+            ].to_dict("records")
+        )
+    return pd.DataFrame(rows)
+
+
+def _volatility_proxy_summary_rows(daily: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if daily.empty:
+        return rows
+    daily_rows = daily[daily.get("section", pd.Series(dtype=str)) == "daily_proxy_coverage"].copy()
+    if daily_rows.empty:
+        return rows
+    metrics = [
+        "VolatilityComplacencyRisk",
+        "atm_straddle_premium_ratio_30d",
+        "put_skew_proxy_30d",
+        "put_call_volume_ratio_tradable",
+        "realized_vol_20d",
+    ]
+    for label, pre in daily_rows.groupby("crash_label", sort=False):
+        if pre.empty:
+            continue
+        local_ratio = float(pre["local_proxy_available"].astype(bool).mean()) if "local_proxy_available" in pre else float("nan")
+        row: dict[str, Any] = {
+            "section": "aggregate_summary",
+            "crash_label": label,
+            "pre_window_days": int(len(pre)),
+            "local_proxy_coverage_ratio": local_ratio,
+            "realized_vol_fallback_days": int(pre.get("fallback_realized_vol_used", pd.Series(False, index=pre.index)).astype(bool).sum()),
+            "missing_volatility_days": int(pre.get("missing_volatility", pd.Series(False, index=pre.index)).astype(bool).sum()),
+        }
+        for source, count in pre["volatility_source_type"].fillna("MISSING").astype(str).value_counts().items():
+            row[f"volatility_source_type_{source}_days"] = int(count)
+        for metric in metrics:
+            stats = _series_start_end_stats(pre.get(metric, pd.Series(dtype=float)))
+            for key, value in stats.items():
+                row[f"{metric}_{key}"] = value
+        row["diagnostic_reason"] = _volatility_diagnostic_reason(pre)
+        rows.append(row)
+    return rows
+
+
+def _volatility_proxy_comparison_rows(daily: pd.DataFrame) -> list[dict[str, Any]]:
+    summaries = pd.DataFrame(_volatility_proxy_summary_rows(daily))
+    if summaries.empty or not {"2008", "2020"}.issubset(set(summaries.get("crash_label", pd.Series(dtype=str)).astype(str))):
+        return []
+    r2008 = summaries[summaries["crash_label"].astype(str) == "2008"].iloc[0]
+    r2020 = summaries[summaries["crash_label"].astype(str) == "2020"].iloc[0]
+    return [
+        {
+            "section": "comparison_summary",
+            "crash_label": "2008_vs_2020",
+            "local_proxy_coverage_ratio_2008": r2008.get("local_proxy_coverage_ratio", np.nan),
+            "local_proxy_coverage_ratio_2020": r2020.get("local_proxy_coverage_ratio", np.nan),
+            "VolatilityComplacencyRisk_change_2008": r2008.get("VolatilityComplacencyRisk_change", np.nan),
+            "VolatilityComplacencyRisk_change_2020": r2020.get("VolatilityComplacencyRisk_change", np.nan),
+            "realized_vol_20d_change_2008": r2008.get("realized_vol_20d_change", np.nan),
+            "realized_vol_20d_change_2020": r2020.get("realized_vol_20d_change", np.nan),
+            "detail": "comparison is descriptive only; it does not alter weights, formula, target mapping, or execution",
+        }
+    ]
+
+
+def _series_start_end_stats(series: pd.Series) -> dict[str, float]:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return {"start": np.nan, "end": np.nan, "max": np.nan, "min": np.nan, "change": np.nan}
+    start = float(clean.iloc[0])
+    end = float(clean.iloc[-1])
+    return {"start": start, "end": end, "max": float(clean.max()), "min": float(clean.min()), "change": float(end - start)}
+
+
+def _volatility_diagnostic_reason(pre: pd.DataFrame) -> str:
+    vol_stats = _series_start_end_stats(pre.get("VolatilityComplacencyRisk", pd.Series(dtype=float)))
+    if pd.isna(vol_stats["change"]):
+        return "VOLATILITY_RISK_UNAVAILABLE"
+    local_ratio = float(pre.get("local_proxy_available", pd.Series(False, index=pre.index)).astype(bool).mean())
+    if local_ratio == 0.0:
+        return "LOCAL_PROXY_MISSING"
+    if vol_stats["change"] >= 0:
+        return "VOLATILITY_RISK_ROSE"
+    reasons = []
+    straddle = _series_start_end_stats(pre.get("atm_straddle_premium_ratio_30d", pd.Series(dtype=float)))
+    put_call = _series_start_end_stats(pre.get("put_call_volume_ratio_tradable", pd.Series(dtype=float)))
+    skew = _series_start_end_stats(pre.get("put_skew_proxy_30d", pd.Series(dtype=float)))
+    realized = _series_start_end_stats(pre.get("realized_vol_20d", pd.Series(dtype=float)))
+    if not pd.isna(straddle["change"]) and straddle["change"] > 0:
+        reasons.append("ATM_STRADDLE_ROSE_LOWERING_COMPLACENCY_SCORE_UNDER_FIXED_FORMULA")
+    if not pd.isna(put_call["change"]) and put_call["change"] > 0:
+        reasons.append("PUT_CALL_RATIO_ROSE_LOWERING_COMPLACENCY_SCORE_UNDER_FIXED_FORMULA")
+    if not pd.isna(skew["change"]) and skew["change"] < 0:
+        reasons.append("PUT_SKEW_PROXY_FELL")
+    if not pd.isna(realized["change"]) and realized["change"] <= 0:
+        reasons.append("REALIZED_VOL_DID_NOT_RISE_IN_PRE_WINDOW")
+    return ";".join(reasons) if reasons else "LOCAL_PROXY_COMPONENTS_MUTED_FIXED_FORMULA_SCORE"
 
 
 def _daily_attribution(score: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
@@ -544,6 +733,66 @@ def _attribution_markdown(attribution: pd.DataFrame) -> str:
             "- This report is attribution only.",
             "- It does not alter fixed weights or target coverage mapping.",
             "- It does not infer rules from crash windows.",
+            "- It is not an investment conclusion.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _volatility_proxy_markdown(audit: pd.DataFrame) -> str:
+    daily = audit[audit["section"] == "daily_proxy_coverage"] if not audit.empty and "section" in audit else pd.DataFrame()
+    summary = audit[audit["section"] == "aggregate_summary"] if not audit.empty and "section" in audit else pd.DataFrame()
+    comparison = audit[audit["section"] == "comparison_summary"] if not audit.empty and "section" in audit else pd.DataFrame()
+    lines = [
+        "# Volatility Proxy Coverage Audit",
+        "",
+        "This report diagnoses 2008 and 2020 pre-crash volatility proxy coverage. It does not change the score formula, weights, target mapping, or execution.",
+        "",
+        "## Source Coverage",
+        "",
+    ]
+    if daily.empty:
+        lines.append("- No daily pre-window rows.")
+    else:
+        for label, group in daily.groupby("crash_label", sort=False):
+            source_counts = group["volatility_source_type"].fillna("MISSING").astype(str).value_counts().to_dict()
+            local_ratio = float(group["local_proxy_available"].astype(bool).mean()) if "local_proxy_available" in group else float("nan")
+            lines.append(f"- {label}: local_proxy_coverage_ratio={local_ratio:.4f}, volatility_source_type={source_counts}")
+    lines.extend(["", "## Aggregate Summary", ""])
+    if summary.empty:
+        lines.append("- No aggregate rows.")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.crash_label}: VolatilityComplacencyRisk_change={getattr(row, 'VolatilityComplacencyRisk_change', np.nan)}, "
+                f"realized_vol_20d_change={getattr(row, 'realized_vol_20d_change', np.nan)}, "
+                f"reason={getattr(row, 'diagnostic_reason', '')}"
+            )
+    lines.extend(["", "## 2008 vs 2020", ""])
+    if comparison.empty:
+        lines.append("- No comparison row.")
+    else:
+        row = comparison.iloc[0]
+        lines.append(
+            "- 2008 local proxy coverage ratio="
+            f"{row.get('local_proxy_coverage_ratio_2008', np.nan)}, "
+            "2020 local proxy coverage ratio="
+            f"{row.get('local_proxy_coverage_ratio_2020', np.nan)}"
+        )
+        lines.append(
+            "- 2008 VolatilityComplacencyRisk change="
+            f"{row.get('VolatilityComplacencyRisk_change_2008', np.nan)}, "
+            "2020 VolatilityComplacencyRisk change="
+            f"{row.get('VolatilityComplacencyRisk_change_2020', np.nan)}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This is a diagnostic report only.",
+            "- It does not tune crash windows or infer new rules.",
+            "- It does not create trades.",
             "- It is not an investment conclusion.",
         ]
     )
