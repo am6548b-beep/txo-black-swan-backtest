@@ -292,7 +292,8 @@ def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_
     rolling = _rolling_coverage_gap_analysis(variant_runs + exit_variant_runs + moneyness_runs, market, options, config, put_params)
     rolling.to_csv(report_dir / "rolling_coverage_gap_analysis.csv", index=False)
     (report_dir / "rolling_coverage_gap_analysis.md").write_text(_rolling_coverage_markdown(rolling), encoding="utf-8")
-    rolling_replacement = _run_rolling_replacement_comparison(market, options, portfolio, config, put_params, ic_params)
+    rolling_replacement_runs = _run_rolling_replacement_engines(market, options, portfolio, config, put_params, ic_params)
+    rolling_replacement = _rolling_replacement_comparison_from_runs(rolling_replacement_runs, market, config)
     rolling_replacement.to_csv(report_dir / "rolling_replacement_variant_comparison.csv", index=False)
     (report_dir / "rolling_replacement_variant_comparison.md").write_text(_rolling_replacement_markdown(rolling_replacement), encoding="utf-8")
     return comparison
@@ -2032,12 +2033,31 @@ def _run_rolling_replacement_comparison(
     put_params: dict,
     ic_params: dict,
 ) -> pd.DataFrame:
+    return _rolling_replacement_comparison_from_runs(
+        _run_rolling_replacement_engines(market, options, portfolio, config, put_params, ic_params),
+        market,
+        config,
+    )
+
+
+def _run_rolling_replacement_engines(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
     for label, (engine_variant, exit_dte) in ROLLING_REPLACEMENT_VARIANTS.items():
         local_put_params = put_params.copy()
         if exit_dte is not None:
             local_put_params["exit_dte"] = exit_dte
         runs.append(_run_single_variant_engine(label, market, options, portfolio, config, local_put_params, ic_params, engine_variant))
+    return runs
+
+
+def _rolling_replacement_comparison_from_runs(runs: list[dict[str, Any]], market: pd.DataFrame, config: dict) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for run in runs:
         variant = str(run["variant"])

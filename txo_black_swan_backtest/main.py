@@ -11,6 +11,7 @@ from config import BASE_CONFIG, COARSE_PARAM_GRID, IRON_CONDOR_PARAMS, PUT_SPREA
 from src.backtester import run_backtest
 from src.data_pipeline import build_processed_data
 from src.data_validation import validate_data
+from src.hedge_need import write_hedge_need_diagnostics
 from src.pathing import ensure_data_layout, resolve_processed_data_dir, resolve_raw_data_dir, resolve_runtime_data_dir
 from src.put_spread_analysis import write_put_spread_real_data_analysis
 from src.put_spread_coverage import write_put_spread_coverage_audit
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
             "put_spread_analysis",
             "put_spread_coverage",
             "put_spread_variants",
+            "hedge_need_diagnostics",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
@@ -115,6 +117,14 @@ def main() -> None:
         comparison = run_put_spread_variants(processed_data_dir, root / "reports", config, put_params, ic_params)
         print(f"Put spread variant comparison written to {root / 'reports' / 'put_spread_variant_comparison.csv'}")
         print(f"Rows: {len(comparison)}")
+        return
+
+    if args.mode == "hedge_need_diagnostics":
+        score, coverage, audit = write_hedge_need_diagnostics(processed_data_dir, root / "reports", config, put_params)
+        print(f"Hedge need score written to {root / 'reports' / 'hedge_need_score.csv'}")
+        print(f"Hedge coverage timeline written to {root / 'reports' / 'hedge_coverage_timeline.csv'}")
+        print(f"Hedge gap audit written to {root / 'reports' / 'hedge_gap_audit.csv'}")
+        print(f"Rows: score={len(score)}, coverage={len(coverage)}, audit={len(audit)}")
         return
 
     if args.mode == "stress":
