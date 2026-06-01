@@ -14,6 +14,7 @@ from src.hedge_need import (
     _markdown,
 )
 from src.risk_indicator_downloader import read_source_registry, _combine_frames, _audit_markdown
+from src.risk_indicator_builder import build_local_risk_indicator_frame, _audit_markdown as _local_audit_markdown
 
 
 def test_target_hedge_coverage_mapping() -> None:
@@ -245,3 +246,221 @@ def test_failed_download_audit_does_not_imply_fill() -> None:
 
     assert "failed" in text
     assert "no mock values" in text
+
+
+def test_local_put_call_ratio_calculation() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "txf_close": [10000.0]})
+    options = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"] * 2),
+            "expiry": pd.to_datetime(["2024-02-01"] * 2),
+            "dte": [30, 30],
+            "cp": ["P", "C"],
+            "strike": [10000.0, 10000.0],
+            "bid": [10.0, 20.0],
+            "ask": [12.0, 22.0],
+            "volume": [200.0, 100.0],
+            "open_interest": [300.0, 100.0],
+            "quote_quality_status": ["VALID", "VALID"],
+            "is_tradable_quote": [True, True],
+        }
+    )
+    out = build_local_risk_indicator_frame(market, options)
+
+    assert out.loc[0, "put_call_volume_ratio_all"] == 2.0
+    assert out.loc[0, "put_call_oi_ratio_all"] == 3.0
+
+
+def test_local_tradable_only_uses_valid_quote() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "txf_close": [10000.0]})
+    options = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"] * 3),
+            "expiry": pd.to_datetime(["2024-02-01"] * 3),
+            "dte": [30, 30, 30],
+            "cp": ["P", "P", "C"],
+            "strike": [10000.0, 9900.0, 10000.0],
+            "bid": [10.0, 99.0, 20.0],
+            "ask": [12.0, 101.0, 22.0],
+            "volume": [200.0, 1000.0, 100.0],
+            "open_interest": [300.0, 1000.0, 100.0],
+            "quote_quality_status": ["VALID", "ZERO_BID", "VALID"],
+            "is_tradable_quote": [True, False, True],
+        }
+    )
+    out = build_local_risk_indicator_frame(market, options)
+
+    assert out.loc[0, "put_call_volume_ratio_all"] == 12.0
+    assert out.loc[0, "put_call_volume_ratio_tradable"] == 2.0
+
+
+def test_local_atm_selects_nearest_strike() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "txf_close": [10050.0]})
+    rows = []
+    for strike, bid in [(9900.0, 90.0), (10000.0, 10.0), (10200.0, 80.0)]:
+        for cp in ["P", "C"]:
+            rows.append(
+                {
+                    "date": pd.Timestamp("2024-01-01"),
+                    "expiry": pd.Timestamp("2024-02-01"),
+                    "dte": 30,
+                    "cp": cp,
+                    "strike": strike,
+                    "bid": bid,
+                    "ask": bid + 2.0,
+                    "volume": 100.0,
+                    "open_interest": 100.0,
+                    "quote_quality_status": "VALID",
+                    "is_tradable_quote": True,
+                }
+            )
+    out = build_local_risk_indicator_frame(market, pd.DataFrame(rows))
+
+    assert out.loc[0, "atm_put_premium_ratio_30d"] == (11.0 / 10050.0)
+
+
+def test_local_missing_data_outputs_nan_not_zero() -> None:
+    market = pd.DataFrame({"date": pd.to_datetime(["2024-01-01"]), "txf_close": [10000.0]})
+    options = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "expiry": pd.to_datetime(["2024-04-01"]),
+            "dte": [90],
+            "cp": ["P"],
+            "strike": [9000.0],
+            "bid": [10.0],
+            "ask": [12.0],
+            "volume": [100.0],
+            "open_interest": [100.0],
+            "quote_quality_status": ["VALID"],
+            "is_tradable_quote": [True],
+        }
+    )
+    out = build_local_risk_indicator_frame(market, options)
+
+    assert pd.isna(out.loc[0, "atm_straddle_premium_ratio_30d"])
+
+
+def test_local_proxy_confidence_not_high() -> None:
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"] * 60),
+            "tx_close": [100.0] * 60,
+            "ma200": [100.0] * 60,
+            "ret_126d": [0.0] * 60,
+            "drawdown_20d_from_high": [0.0] * 60,
+            "vix_percentile_3y": [50.0] * 60,
+            "ValuationRiskIndex": [50.0] * 60,
+            "MacroDemandFragilityIndex": [0.0] * 60,
+            "SupplyStressIndex": [0.0] * 60,
+            "LiquidityStressIndex": [50.0] * 60,
+            "vix_is_proxy": [False] * 60,
+            "iv_proxy_source": ["local_txo_chain_proxy"] * 60,
+            "atm_straddle_premium_ratio_30d": [0.05] * 60,
+        }
+    )
+    score = hedge_need_score_frame(market)
+    attribution = hedge_need_score_attribution(score, market)
+    confidence = set(attribution[attribution["section"] == "daily_attribution"]["score_confidence"])
+
+    assert "HIGH" not in confidence
+
+
+def test_local_proxy_source_type_not_official_vix() -> None:
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "tx_close": [100.0],
+            "ma200": [100.0],
+            "ret_126d": [0.0],
+            "drawdown_20d_from_high": [0.0],
+            "vix": [20.0],
+            "vix_percentile_3y": [50.0],
+            "ValuationRiskIndex": [55.0],
+            "MacroDemandFragilityIndex": [10.0],
+            "SupplyStressIndex": [10.0],
+            "LiquidityStressIndex": [55.0],
+            "vix_is_proxy": [False],
+            "iv_proxy_source": ["local_txo_chain_proxy"],
+            "atm_straddle_premium_ratio_30d": [0.05],
+        }
+    )
+    score = hedge_need_score_frame(market)
+
+    assert score.loc[0, "volatility_source_type"] == "LOCAL_TXO_PROXY"
+
+
+def test_realized_vol_proxy_confidence_low() -> None:
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "tx_close": [100.0],
+            "ma200": [100.0],
+            "ret_126d": [0.0],
+            "drawdown_20d_from_high": [0.0],
+            "vix": [20.0],
+            "vix_percentile_3y": [50.0],
+            "ValuationRiskIndex": [55.0],
+            "MacroDemandFragilityIndex": [10.0],
+            "SupplyStressIndex": [10.0],
+            "LiquidityStressIndex": [55.0],
+            "vix_is_proxy": [True],
+        }
+    )
+    score = hedge_need_score_frame(market)
+    attribution = hedge_need_score_attribution(score, market)
+
+    assert attribution[attribution["section"] == "daily_attribution"]["score_confidence"].iloc[0] == "LOW"
+
+
+def test_missing_volatility_source_not_high() -> None:
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "tx_close": [100.0],
+            "ma200": [100.0],
+            "ret_126d": [0.0],
+            "drawdown_20d_from_high": [0.0],
+            "vix": [pd.NA],
+            "vix_percentile_3y": [pd.NA],
+            "ValuationRiskIndex": [55.0],
+            "MacroDemandFragilityIndex": [10.0],
+            "SupplyStressIndex": [10.0],
+            "LiquidityStressIndex": [55.0],
+            "vix_is_proxy": [False],
+        }
+    )
+    score = hedge_need_score_frame(market)
+    attribution = hedge_need_score_attribution(score, market)
+
+    assert attribution[attribution["section"] == "daily_attribution"]["score_confidence"].iloc[0] != "HIGH"
+
+
+def test_default_flat_macro_quality_not_high() -> None:
+    market = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "tx_close": [100.0],
+            "ma200": [100.0],
+            "ret_126d": [0.0],
+            "drawdown_20d_from_high": [0.0],
+            "vix": [20.0],
+            "vix_percentile_3y": [50.0],
+            "ValuationRiskIndex": [50.0],
+            "MacroDemandFragilityIndex": [0.0],
+            "SupplyStressIndex": [0.0],
+            "LiquidityStressIndex": [50.0],
+            "vix_is_proxy": [False],
+        }
+    )
+    score = hedge_need_score_frame(market)
+    attribution = hedge_need_score_attribution(score, market)
+
+    assert attribution[attribution["section"] == "daily_attribution"]["score_confidence"].iloc[0] != "HIGH"
+
+
+def test_local_risk_indicator_report_has_no_best_or_recommend() -> None:
+    text = _local_audit_markdown(pd.DataFrame()).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text

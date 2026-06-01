@@ -85,7 +85,9 @@ def hedge_need_score_frame(market: pd.DataFrame) -> pd.DataFrame:
     out = market.sort_values("date").copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["ValuationRisk"] = pd.to_numeric(out.get("ValuationRiskIndex", 50.0), errors="coerce").fillna(50.0).clip(0, 100)
+    local_proxy_risk = _local_volatility_proxy_risk(out)
     out["VolatilityComplacencyRisk"] = (100.0 - pd.to_numeric(out.get("vix_percentile_3y", np.nan), errors="coerce")).clip(0, 100)
+    out["VolatilityComplacencyRisk"] = local_proxy_risk.combine_first(out["VolatilityComplacencyRisk"])
     out["VolatilityComplacencyRisk"] = out["VolatilityComplacencyRisk"].fillna(50.0)
     out["MacroDemandFragility"] = pd.to_numeric(out.get("MacroDemandFragilityIndex", 0.0), errors="coerce").fillna(0.0).clip(0, 100)
     out["SupplyStressIndex"] = pd.to_numeric(out.get("SupplyStressIndex", 0.0), errors="coerce").fillna(0.0).clip(0, 100)
@@ -95,6 +97,9 @@ def hedge_need_score_frame(market: pd.DataFrame) -> pd.DataFrame:
     out["target_hedge_coverage"] = out["HedgeNeedScore"].map(target_hedge_coverage)
     vix_proxy = out.get("vix_is_proxy", pd.Series(False, index=out.index))
     out["vix_proxy_in_use"] = vix_proxy.astype(bool).values if isinstance(vix_proxy, pd.Series) else bool(vix_proxy)
+    out["iv_proxy_source"] = out.get("iv_proxy_source", "")
+    out["volatility_source_type"] = _volatility_source_type(out)
+    out["macro_data_quality_flag"] = _macro_data_quality_flag(out)
     return out[
         [
             "date",
@@ -107,6 +112,9 @@ def hedge_need_score_frame(market: pd.DataFrame) -> pd.DataFrame:
             "TrendFragility",
             "target_hedge_coverage",
             "vix_proxy_in_use",
+            "iv_proxy_source",
+            "volatility_source_type",
+            "macro_data_quality_flag",
         ]
     ]
 
@@ -127,7 +135,26 @@ def apply_risk_indicators_to_market(market: pd.DataFrame, risk: pd.DataFrame) ->
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     risk = risk.copy()
     risk["date"] = pd.to_datetime(risk["date"], errors="coerce")
-    use_cols = [col for col in ["date", "tw_vix", "tw_vix_is_proxy", "cpi_yoy", "core_cpi_yoy", "us10y", "us2y", "dxy"] if col in risk.columns]
+    use_cols = [
+        col
+        for col in [
+            "date",
+            "tw_vix",
+            "tw_vix_is_proxy",
+            "put_call_volume_ratio_tradable",
+            "put_call_oi_ratio_tradable",
+            "atm_straddle_premium_ratio_30d",
+            "put_skew_proxy_30d",
+            "iv_term_structure_proxy",
+            "iv_proxy_source",
+            "cpi_yoy",
+            "core_cpi_yoy",
+            "us10y",
+            "us2y",
+            "dxy",
+        ]
+        if col in risk.columns
+    ]
     merged = out.merge(risk[use_cols], on="date", how="left", suffixes=("", "_risk"))
     if "tw_vix" in merged.columns:
         merged["tw_vix"] = pd.to_numeric(merged["tw_vix"], errors="coerce")
@@ -137,6 +164,14 @@ def apply_risk_indicators_to_market(market: pd.DataFrame, risk: pd.DataFrame) ->
             merged["vix_is_proxy"] = True
         merged.loc[has_tw_vix, "vix_is_proxy"] = False
         merged.loc[~has_tw_vix, "vix_is_proxy"] = merged.loc[~has_tw_vix, "vix_is_proxy"].fillna(True)
+    local_cols = ["put_call_volume_ratio_tradable", "atm_straddle_premium_ratio_30d", "put_skew_proxy_30d", "iv_term_structure_proxy"]
+    local_available = merged[[col for col in local_cols if col in merged.columns]].notna().any(axis=1) if any(col in merged.columns for col in local_cols) else pd.Series(False, index=merged.index)
+    if "vix_is_proxy" not in merged.columns:
+        merged["vix_is_proxy"] = True
+    merged.loc[local_available & ~merged.get("tw_vix", pd.Series(np.nan, index=merged.index)).notna(), "vix_is_proxy"] = False
+    if "iv_proxy_source" not in merged.columns:
+        merged["iv_proxy_source"] = ""
+    merged.loc[local_available & merged["iv_proxy_source"].astype(str).eq(""), "iv_proxy_source"] = "local_txo_chain_proxy"
     for col in ["cpi_yoy", "core_cpi_yoy"]:
         if col in merged.columns:
             merged[col] = pd.to_numeric(merged[col], errors="coerce")
@@ -247,6 +282,7 @@ def hedge_need_score_attribution(score: pd.DataFrame, market: pd.DataFrame) -> p
     rows: list[dict[str, Any]] = daily.to_dict("records")
     rows.extend(_crash_attribution_rows(daily))
     rows.extend(_false_calm_rows(daily, market))
+    rows.extend(_data_source_quality_rows(daily))
     rows.append(
         {
             "section": "overfitting_controls",
@@ -276,6 +312,9 @@ def _daily_attribution(score: pd.DataFrame, market: pd.DataFrame) -> pd.DataFram
         "weighted_sum_check",
         "vix_proxy_in_use",
         "macro_proxy_missing_count",
+        "iv_proxy_source",
+        "volatility_source_type",
+        "macro_data_quality_flag",
         "score_confidence",
     ]
     return out[list(cols)]
@@ -361,6 +400,35 @@ def _false_calm_rows(daily: pd.DataFrame, market: pd.DataFrame) -> list[dict[str
     return rows
 
 
+def _data_source_quality_rows(daily: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if daily.empty:
+        return rows
+    for source, count in daily["volatility_source_type"].fillna("MISSING").astype(str).value_counts().items():
+        rows.append({"section": "data_source_quality", "metric": "volatility_source_type_distribution", "volatility_source_type": source, "days": int(count)})
+    rows.extend(
+        [
+            {"section": "data_source_quality", "metric": "official_vix_days", "days": int((daily["volatility_source_type"] == "OFFICIAL_VIX").sum())},
+            {"section": "data_source_quality", "metric": "local_txo_proxy_days", "days": int((daily["volatility_source_type"] == "LOCAL_TXO_PROXY").sum())},
+            {"section": "data_source_quality", "metric": "realized_vol_proxy_days", "days": int((daily["volatility_source_type"] == "REALIZED_VOL_PROXY").sum())},
+            {"section": "data_source_quality", "metric": "missing_volatility_days", "days": int((daily["volatility_source_type"] == "MISSING").sum())},
+            {
+                "section": "data_source_quality",
+                "metric": "days_incorrectly_capped_before_fix",
+                "days": int(
+                    (
+                        daily["score_confidence"].eq("HIGH")
+                        & daily["volatility_source_type"].isin(["LOCAL_TXO_PROXY", "REALIZED_VOL_PROXY", "MISSING"])
+                    ).sum()
+                ),
+            },
+        ]
+    )
+    for flag, count in daily["macro_data_quality_flag"].fillna("MISSING").astype(str).value_counts().items():
+        rows.append({"section": "data_source_quality", "metric": "macro_data_quality_flag_distribution", "macro_data_quality_flag": flag, "days": int(count)})
+    return rows
+
+
 def _append_budget_and_attempt_flags(coverage: pd.DataFrame, trades: pd.DataFrame, config: dict) -> pd.DataFrame:
     out = coverage.copy()
     spend = _annual_entry_spend_by_date(trades)
@@ -404,9 +472,14 @@ def _macro_missing_count(market: pd.DataFrame) -> pd.DataFrame:
 
 def _score_confidence(row: pd.Series) -> str:
     missing = int(row.get("macro_proxy_missing_count", 0))
-    vix_proxy = bool(row.get("vix_proxy_in_use", False))
-    if vix_proxy or missing >= 3:
+    vol_source = str(row.get("volatility_source_type", "MISSING"))
+    macro_quality = str(row.get("macro_data_quality_flag", "MISSING"))
+    if vol_source in {"REALIZED_VOL_PROXY", "MISSING"}:
         return "LOW"
+    if missing >= 3 or macro_quality in {"DEFAULT_FLAT", "MISSING"}:
+        return "LOW"
+    if vol_source == "LOCAL_TXO_PROXY":
+        return "MEDIUM"
     if missing > 0:
         return "MEDIUM"
     return "HIGH"
@@ -424,6 +497,7 @@ def _attribution_markdown(attribution: pd.DataFrame) -> str:
     crash = attribution[attribution["section"] == "crash_pre_window_attribution"] if not attribution.empty else pd.DataFrame()
     confidence = attribution[attribution["section"] == "daily_attribution"]["score_confidence"].value_counts() if not attribution.empty and "score_confidence" in attribution else pd.Series(dtype=int)
     false_calm = attribution[attribution["section"] == "false_calm_diagnostic"] if not attribution.empty else pd.DataFrame()
+    sources = attribution[attribution["section"] == "data_source_quality"] if not attribution.empty else pd.DataFrame()
     lines = [
         "# Hedge Need Score Attribution",
         "",
@@ -453,6 +527,15 @@ def _attribution_markdown(attribution: pd.DataFrame) -> str:
     else:
         for row in false_calm.itertuples(index=False):
             lines.append(f"- {row.check}: {row.status}, flagged_days={row.flagged_days}")
+    lines.extend(["", "## Data Source Quality", ""])
+    if sources.empty:
+        lines.append("- No data source quality rows.")
+    else:
+        for row in sources.itertuples(index=False):
+            metric = getattr(row, "metric", "")
+            source = getattr(row, "volatility_source_type", "") or getattr(row, "macro_data_quality_flag", "")
+            days = getattr(row, "days", "")
+            lines.append(f"- {metric} {source}: {days}")
     lines.extend(
         [
             "",
@@ -476,6 +559,74 @@ def _trend_fragility(market: pd.DataFrame) -> pd.Series:
     ret_score = _scale_series(-ret_126d, -0.05, 0.20)
     dd_score = _scale_series(-dd20, 0.03, 0.18)
     return (0.4 * ma_score + 0.3 * ret_score + 0.3 * dd_score).fillna(50.0).clip(0, 100)
+
+
+def _volatility_source_type(market: pd.DataFrame) -> pd.Series:
+    local_cols = ["put_call_volume_ratio_tradable", "atm_straddle_premium_ratio_30d", "put_skew_proxy_30d", "iv_term_structure_proxy"]
+    local_available = pd.Series(False, index=market.index)
+    for col in local_cols:
+        if col in market.columns:
+            local_available |= pd.to_numeric(market[col], errors="coerce").notna()
+    official_available = pd.to_numeric(market.get("tw_vix", pd.Series(np.nan, index=market.index)), errors="coerce").notna()
+    vix_proxy = market.get("vix_is_proxy", pd.Series(True, index=market.index)).astype(bool)
+    vix_available = pd.to_numeric(market.get("vix", pd.Series(np.nan, index=market.index)), errors="coerce").notna()
+    out = pd.Series("MISSING", index=market.index, dtype=object)
+    out.loc[official_available] = "OFFICIAL_VIX"
+    out.loc[local_available & (out != "OFFICIAL_VIX")] = "LOCAL_TXO_PROXY"
+    out.loc[vix_available & vix_proxy & ~local_available] = "REALIZED_VOL_PROXY"
+    return out
+
+
+def _macro_data_quality_flag(market: pd.DataFrame) -> pd.Series:
+    modules = ["ValuationRiskIndex", "MacroDemandFragilityIndex", "SupplyStressIndex", "LiquidityStressIndex"]
+    available = [col for col in modules if col in market.columns]
+    if not available:
+        return pd.Series("MISSING", index=market.index, dtype=object)
+    values = market[available].apply(pd.to_numeric, errors="coerce")
+    missing_any = values.isna().any(axis=1)
+    default_flat = pd.Series(False, index=market.index)
+    if "ValuationRiskIndex" in values:
+        default_flat |= values["ValuationRiskIndex"].eq(50.0)
+    if "MacroDemandFragilityIndex" in values:
+        default_flat |= values["MacroDemandFragilityIndex"].eq(0.0)
+    if "SupplyStressIndex" in values:
+        default_flat |= values["SupplyStressIndex"].eq(0.0)
+    if "LiquidityStressIndex" in values:
+        default_flat |= values["LiquidityStressIndex"].eq(50.0)
+    out = pd.Series("OBSERVED", index=market.index, dtype=object)
+    out.loc[default_flat] = "DEFAULT_FLAT"
+    out.loc[missing_any] = "MISSING"
+    return out
+
+
+def _local_volatility_proxy_risk(market: pd.DataFrame) -> pd.Series:
+    components = []
+    if "put_call_volume_ratio_tradable" in market.columns:
+        pc = pd.to_numeric(market["put_call_volume_ratio_tradable"], errors="coerce")
+        components.append((100.0 - _rolling_percentile_current(pc)).clip(0, 100))
+    if "atm_straddle_premium_ratio_30d" in market.columns:
+        straddle = pd.to_numeric(market["atm_straddle_premium_ratio_30d"], errors="coerce")
+        components.append((100.0 - _rolling_percentile_current(straddle)).clip(0, 100))
+    if "put_skew_proxy_30d" in market.columns:
+        skew = pd.to_numeric(market["put_skew_proxy_30d"], errors="coerce")
+        components.append(_rolling_percentile_current(skew).clip(0, 100))
+    if "iv_term_structure_proxy" in market.columns:
+        term = pd.to_numeric(market["iv_term_structure_proxy"], errors="coerce")
+        components.append(_rolling_percentile_current(term).clip(0, 100))
+    if not components:
+        return pd.Series(np.nan, index=market.index)
+    return pd.concat(components, axis=1).mean(axis=1, skipna=True)
+
+
+def _rolling_percentile_current(series: pd.Series, window: int = 252, min_periods: int = 60) -> pd.Series:
+    def pct(values: pd.Series) -> float:
+        current = values.iloc[-1]
+        past = values.dropna()
+        if pd.isna(current) or len(past) < min_periods:
+            return float("nan")
+        return float((past <= current).mean() * 100.0)
+
+    return series.rolling(window=window, min_periods=min_periods).apply(pct, raw=False)
 
 
 def _put_spread_positions(trades: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
