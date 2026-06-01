@@ -4,7 +4,18 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.put_spread_variants import PutSpreadVariantStateMachine, _entry_time_feasibility_filter, run_put_spread_variants
+from src.put_spread_variants import (
+    PutSpreadVariantStateMachine,
+    _coverage_timeline_rows,
+    _entry_time_feasibility_filter,
+    _exit_timing_diagnostic,
+    _gap_summary_rows,
+    _leg_quote,
+    _rolling_coverage_markdown,
+    _run_exit_timing_variants,
+    _run_moneyness_tradability_diagnostic,
+    run_put_spread_variants,
+)
 
 
 def _config() -> dict:
@@ -310,3 +321,242 @@ def test_entry_time_feasibility_filter_ignores_future_data() -> None:
     assert result["filter_decision"] == "SKIP_EXIT_UNLIKELY"
     assert result["no_lookahead_pass"] is True
     assert pd.Timestamp(result["long_filter_max_reference_date"]) <= pd.Timestamp("2024-01-02")
+
+
+def test_exit_timing_diagnostic_does_not_modify_trades() -> None:
+    dates = ["2024-01-02"]
+    options = _history_options("2024-01-02", past_valid_days=3, past_invalid_days=0)
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="quarterly_base_insurance",
+    )
+    equity, trades = engine.run()
+    before = trades.copy(deep=True)
+    _exit_timing_diagnostic(
+        [{"variant": "quarterly_base_insurance", "trades": trades, "lifecycle": pd.DataFrame(equity.attrs.get("position_lifecycle_events", []))}],
+        options,
+        _config(),
+        _put_params(),
+    )
+    pd.testing.assert_frame_equal(before, trades)
+
+
+def test_last_valid_full_spread_requires_both_legs_valid() -> None:
+    options = _history_options("2024-01-02", past_valid_days=0, past_invalid_days=0)
+    expiry = pd.Timestamp("2024-04-17")
+    date = expiry - pd.Timedelta(days=30)
+    rows = []
+    rows.append({**_options("2024-01-02").iloc[0].to_dict(), "date": date, "expiry": expiry, "quote_quality_status": "VALID", "is_tradable_quote": True, "volume": 500, "open_interest": 1000, "strike": 9000.0})
+    rows.append({**_options("2024-01-02").iloc[1].to_dict(), "date": date, "expiry": expiry, "quote_quality_status": "ZERO_BID", "is_tradable_quote": False, "volume": 500, "open_interest": 1000, "strike": 7500.0})
+    options = pd.DataFrame(rows)
+    trades = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "position_id": "PS-1", "strategy": "put_spread", "action": "BUY", "cp": "P", "strike": 9000.0, "expiry": "2024-04-17", "quantity": 1, "cash_flow": -1000, "reason": "quarterly_base_put_spread", "dte_at_trade": 106, "txf_close_at_trade": 10000},
+            {"date": "2024-01-02", "position_id": "PS-1", "strategy": "put_spread", "action": "SELL", "cp": "P", "strike": 7500.0, "expiry": "2024-04-17", "quantity": -1, "cash_flow": 100, "reason": "quarterly_base_put_spread", "dte_at_trade": 106, "txf_close_at_trade": 10000},
+        ]
+    )
+    out = _exit_timing_diagnostic([{"variant": "quarterly_base_insurance", "trades": trades, "lifecycle": pd.DataFrame()}], options, _config(), _put_params())
+    pos = out[out["section"] == "position_exit_timing"].iloc[0]
+    assert pd.isna(pos["last_day_both_legs_valid"]) or pos["last_day_both_legs_valid"] == ""
+
+
+def test_hypothetical_exit_availability_does_not_create_trades() -> None:
+    dates = ["2024-01-02"]
+    options = _history_options("2024-01-02", past_valid_days=3, past_invalid_days=0)
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="quarterly_base_insurance",
+    )
+    equity, trades = engine.run()
+    count_before = len(trades)
+    _exit_timing_diagnostic(
+        [{"variant": "quarterly_base_insurance", "trades": trades, "lifecycle": pd.DataFrame(equity.attrs.get("position_lifecycle_events", []))}],
+        options,
+        _config(),
+        _put_params(),
+    )
+    assert len(trades) == count_before
+
+
+def test_exit_timing_markdown_does_not_recommend_best_parameter(tmp_path: Path) -> None:
+    dates = ["2024-01-02"]
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    _market(dates).assign(tx_open=10000.0, tx_high=10000.0, tx_low=10000.0, volume=1)[
+        ["date", "tx_close", "tx_open", "tx_high", "tx_low", "txf_close", "volume", "vix", "event_flag"]
+    ].to_csv(data_dir / "market.csv", index=False)
+    _options("2024-01-02").drop(columns=["underlying", "tradable", "reason"]).to_csv(data_dir / "options.csv", index=False)
+    _portfolio(dates).to_csv(data_dir / "portfolio.csv", index=False)
+    run_put_spread_variants(data_dir, report_dir, _config(), _put_params(), _ic_params())
+    text = (report_dir / "exit_timing_diagnostic.md").read_text(encoding="utf-8").lower()
+    assert "best dte" not in text
+    assert "recommend" not in text
+
+
+def test_exit_timing_variants_keep_quarterly_entry_rules() -> None:
+    dates = ["2024-01-02"]
+    market = _market(dates)
+    options = _history_options("2024-01-02", past_valid_days=10, past_invalid_days=0)
+    comparison = _run_exit_timing_variants(market, options, _portfolio(dates), _config(), _put_params(), _ic_params())
+    summary = comparison[comparison["section"] == "exit_variant_summary"]
+
+    assert set(summary["position_count"]) == {1}
+    assert set(summary["variant"]) == {
+        "quarterly_base_insurance_exit_dte30",
+        "quarterly_base_insurance_exit_dte21",
+        "quarterly_base_insurance_exit_dte14",
+    }
+
+
+def test_exit_timing_variants_do_not_trade_non_valid_or_after_expiry() -> None:
+    dates = ["2024-01-02"]
+    market = _market(dates)
+    options = _history_options("2024-01-02", past_valid_days=10, past_invalid_days=0)
+    comparison = _run_exit_timing_variants(market, options, _portfolio(dates), _config(), _put_params(), _ic_params())
+    audit = comparison[comparison["section"] == "exit_variant_audit"]
+
+    assert (audit[audit["check"] == "non_valid_quote_trades_count"]["count"] == 0).all()
+    assert (audit[audit["check"] == "trade_date_after_expiry_count"]["count"] == 0).all()
+
+
+def test_exit_timing_variant_report_does_not_rank_or_recommend(tmp_path: Path) -> None:
+    dates = ["2024-01-02"]
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    _market(dates).assign(tx_open=10000.0, tx_high=10000.0, tx_low=10000.0, volume=1)[
+        ["date", "tx_close", "tx_open", "tx_high", "tx_low", "txf_close", "volume", "vix", "event_flag"]
+    ].to_csv(data_dir / "market.csv", index=False)
+    _options("2024-01-02").drop(columns=["underlying", "tradable", "reason"]).to_csv(data_dir / "options.csv", index=False)
+    _portfolio(dates).to_csv(data_dir / "portfolio.csv", index=False)
+
+    run_put_spread_variants(data_dir, report_dir, _config(), _put_params(), _ic_params())
+    text = (report_dir / "exit_timing_variant_comparison.md").read_text(encoding="utf-8").lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
+
+
+def test_original_quarterly_variant_not_overwritten_by_exit_timing_variants(tmp_path: Path) -> None:
+    dates = ["2024-01-02"]
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    _market(dates).assign(tx_open=10000.0, tx_high=10000.0, tx_low=10000.0, volume=1)[
+        ["date", "tx_close", "tx_open", "tx_high", "tx_low", "txf_close", "volume", "vix", "event_flag"]
+    ].to_csv(data_dir / "market.csv", index=False)
+    _options("2024-01-02").drop(columns=["underlying", "tradable", "reason"]).to_csv(data_dir / "options.csv", index=False)
+    _portfolio(dates).to_csv(data_dir / "portfolio.csv", index=False)
+
+    run_put_spread_variants(data_dir, report_dir, _config(), _put_params(), _ic_params())
+    base = pd.read_csv(report_dir / "put_spread_variant_comparison.csv")
+    timing = pd.read_csv(report_dir / "exit_timing_variant_comparison.csv")
+
+    assert "quarterly_base_insurance" in set(base["variant"].dropna())
+    assert "quarterly_base_insurance_exit_dte14" in set(timing["variant"].dropna())
+
+
+def test_moneyness_diagnostic_does_not_modify_original_params() -> None:
+    dates = ["2024-01-02"]
+    params = _put_params()
+    before = params.copy()
+    _run_moneyness_tradability_diagnostic(_market(dates), _options("2024-01-02"), _portfolio(dates), _config(), params, _ic_params())
+    assert params == before
+
+
+def test_moneyness_diagnostic_uses_valid_quotes_and_no_expired_trades() -> None:
+    dates = ["2024-01-02"]
+    diagnostic = _run_moneyness_tradability_diagnostic(_market(dates), _options("2024-01-02"), _portfolio(dates), _config(), _put_params(), _ic_params())
+    audit = diagnostic[diagnostic["section"] == "moneyness_audit"]
+
+    assert (audit[audit["check"] == "non_valid_quote_trades_count"]["count"] == 0).all()
+    assert (audit[audit["check"] == "trade_date_after_expiry_count"]["count"] == 0).all()
+
+
+def test_moneyness_report_does_not_rank_or_recommend(tmp_path: Path) -> None:
+    dates = ["2024-01-02"]
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    _market(dates).assign(tx_open=10000.0, tx_high=10000.0, tx_low=10000.0, volume=1)[
+        ["date", "tx_close", "tx_open", "tx_high", "tx_low", "txf_close", "volume", "vix", "event_flag"]
+    ].to_csv(data_dir / "market.csv", index=False)
+    _options("2024-01-02").drop(columns=["underlying", "tradable", "reason"]).to_csv(data_dir / "options.csv", index=False)
+    _portfolio(dates).to_csv(data_dir / "portfolio.csv", index=False)
+
+    run_put_spread_variants(data_dir, report_dir, _config(), _put_params(), _ic_params())
+    text = (report_dir / "moneyness_tradability_diagnostic.md").read_text(encoding="utf-8").lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
+
+
+def test_rolling_gap_calculation_is_correct() -> None:
+    market = _market(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"])
+    trades = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "quarterly_base_put_spread"},
+            {"date": "2024-01-02", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "quarterly_base_put_spread"},
+            {"date": "2024-01-03", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "dte_exit"},
+            {"date": "2024-01-03", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "dte_exit"},
+        ]
+    )
+    timeline = _coverage_timeline_rows("quarterly_base_insurance", trades, pd.DataFrame(), market)
+    summary = _gap_summary_rows("quarterly_base_insurance", timeline)[0]
+
+    assert int(summary["covered_days"]) == 2
+    assert int(summary["uncovered_days"]) == 3
+    assert int(summary["longest_uncovered_gap_days"]) == 2
+
+
+def test_rolling_gap_analysis_does_not_modify_trades() -> None:
+    market = _market(["2024-01-01", "2024-01-02", "2024-01-03"])
+    trades = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "quarterly_base_put_spread"},
+            {"date": "2024-01-02", "position_id": "PS-1", "expiry": "2024-04-17", "reason": "quarterly_base_put_spread"},
+        ]
+    )
+    before = trades.copy(deep=True)
+    _coverage_timeline_rows("quarterly_base_insurance", trades, pd.DataFrame(), market)
+    pd.testing.assert_frame_equal(trades, before)
+
+
+def test_rolling_crash_prewindow_does_not_generate_trades_from_future() -> None:
+    market = _market(["2024-01-01", "2024-01-02"])
+    trades = pd.DataFrame(columns=["date", "position_id", "expiry", "reason"])
+    timeline = _coverage_timeline_rows("quarterly_base_insurance", trades, pd.DataFrame(), market)
+
+    assert timeline["has_active_put_spread"].sum() == 0
+    assert trades.empty
+
+
+def test_rolling_coverage_report_does_not_rank_or_recommend() -> None:
+    diagnostic = pd.DataFrame(
+        [
+            {
+                "section": "gap_summary",
+                "variant": "quarterly_base_insurance",
+                "coverage_ratio": 0.1,
+                "longest_uncovered_gap_days": 10,
+                "number_of_gaps_gt_180d": 0,
+            }
+        ]
+    )
+    text = _rolling_coverage_markdown(diagnostic).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text

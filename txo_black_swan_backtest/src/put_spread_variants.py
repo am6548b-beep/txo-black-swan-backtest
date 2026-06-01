@@ -20,7 +20,7 @@ from .indicators import add_market_indicators
 from .macro_regime import add_macro_regime_indicators, macro_restrictions
 from .metrics import max_drawdown
 from .portfolio import make_state
-from .strategies import BlackSwanStateMachine
+from .strategies import BlackSwanStateMachine, ContractSelector
 from .utils import year_key
 
 
@@ -239,6 +239,20 @@ def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_
     filter_audit = _execution_feasibility_filter_audit(variant_runs, comparison, options, config, put_params)
     filter_audit.to_csv(report_dir / "execution_feasibility_filter_audit.csv", index=False)
     (report_dir / "execution_feasibility_filter_audit.md").write_text(_filter_audit_markdown(filter_audit), encoding="utf-8")
+    exit_timing = _exit_timing_diagnostic(variant_runs, options, config, put_params)
+    exit_timing.to_csv(report_dir / "exit_timing_diagnostic.csv", index=False)
+    (report_dir / "exit_timing_diagnostic.md").write_text(_exit_timing_markdown(exit_timing), encoding="utf-8")
+    exit_variant_runs = _run_exit_timing_variant_engines(market, options, portfolio, config, put_params, ic_params)
+    exit_variant_comparison = _exit_timing_variant_comparison_from_runs(exit_variant_runs, market, config)
+    exit_variant_comparison.to_csv(report_dir / "exit_timing_variant_comparison.csv", index=False)
+    (report_dir / "exit_timing_variant_comparison.md").write_text(_exit_variant_markdown(exit_variant_comparison), encoding="utf-8")
+    moneyness_runs = _run_moneyness_variant_engines(market, options, portfolio, config, put_params, ic_params)
+    moneyness = _moneyness_tradability_from_runs(moneyness_runs, options, config)
+    moneyness.to_csv(report_dir / "moneyness_tradability_diagnostic.csv", index=False)
+    (report_dir / "moneyness_tradability_diagnostic.md").write_text(_moneyness_markdown(moneyness), encoding="utf-8")
+    rolling = _rolling_coverage_gap_analysis(variant_runs + exit_variant_runs + moneyness_runs, market, options, config, put_params)
+    rolling.to_csv(report_dir / "rolling_coverage_gap_analysis.csv", index=False)
+    (report_dir / "rolling_coverage_gap_analysis.md").write_text(_rolling_coverage_markdown(rolling), encoding="utf-8")
     return comparison
 
 
@@ -1193,6 +1207,1029 @@ def _filter_audit_markdown(audit: pd.DataFrame) -> str:
             "- This filter audit does not recommend parameters or rank variants.",
             "- Variant D excludes only EXIT_UNLIKELY candidates; EXIT_FRAGILE candidates remain allowed.",
             "- The entry-time filter uses historical quote/liquidity profile only; diagnostic fields may inspect later paths for audit labels.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _exit_timing_diagnostic(
+    variant_runs: list[dict[str, Any]],
+    options: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+) -> pd.DataFrame:
+    opt = options.copy()
+    opt["date"] = pd.to_datetime(opt["date"], errors="coerce")
+    opt["expiry"] = pd.to_datetime(opt["expiry"], errors="coerce")
+    rows: list[dict[str, Any]] = []
+    position_rows: list[dict[str, Any]] = []
+    bucket_rows: list[dict[str, Any]] = []
+    for run in variant_runs:
+        positions = _position_metadata(str(run["variant"]), run["trades"].copy(), run["lifecycle"].copy())
+        for pos in positions:
+            detail, buckets = _position_exit_timing(pos, opt, config, put_params)
+            position_rows.append(detail)
+            bucket_rows.extend(buckets)
+            rows.append(detail)
+            rows.extend(buckets)
+    rows.extend(_exit_timing_aggregate_rows(pd.DataFrame(position_rows), pd.DataFrame(bucket_rows)))
+    return pd.DataFrame(rows)
+
+
+def _position_exit_timing(
+    pos: dict[str, Any],
+    options: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    expiry = pd.Timestamp(pos["expiry"])
+    relevant = options[
+        (options["expiry"] == expiry)
+        & (options["cp"] == "P")
+        & (np.isclose(options["strike"], float(pos["long_put_strike"])) | np.isclose(options["strike"], float(pos["short_put_strike"])))
+        & (options["date"] <= expiry)
+    ].copy()
+    dte_rule = int(put_params.get("exit_dte", 14))
+    bucket_defs = [
+        ("DTE_45_31", 45, 31),
+        ("DTE_30_21", 30, 21),
+        ("DTE_20_15", 20, 15),
+        ("DTE_14_8", 14, 8),
+        ("DTE_7_1", 7, 1),
+    ]
+    bucket_rows = []
+    all_days = []
+    for label, high, low in bucket_defs:
+        rows = _bucket_availability(pos, relevant, expiry, high, low, config)
+        bucket_rows.append({"section": "dte_bucket_availability", **pos, "dte_bucket": label, **rows})
+        all_days.append(rows["day_frame"])
+    day_frame = pd.concat([frame for frame in all_days if not frame.empty], ignore_index=True) if all_days else pd.DataFrame()
+    full_valid = day_frame[day_frame.get("both_legs_valid", pd.Series(dtype=bool)).astype(bool)].copy()
+    last_valid_date = full_valid["date"].max() if not full_valid.empty else pd.NaT
+    dte_at_last = int((expiry - pd.Timestamp(last_valid_date)).days) if pd.notna(last_valid_date) else ""
+    too_late = bool(pd.notna(last_valid_date) and int(dte_at_last) > dte_rule)
+    detail = {
+        "section": "position_exit_timing",
+        **pos,
+        "exit_reason": pos.get("exit_reason", ""),
+        "last_day_both_legs_valid": "" if pd.isna(last_valid_date) else str(pd.Timestamp(last_valid_date).date()),
+        "dte_at_last_day_both_legs_valid": dte_at_last,
+        "days_between_last_valid_exit_and_current_dte_rule": "" if dte_at_last == "" else int(int(dte_at_last) - dte_rule),
+        "whether_current_dte14_exit_is_too_late": too_late,
+        "would_exit_be_possible_at_dte30": _possible_at_dte(day_frame, 30),
+        "would_exit_be_possible_at_dte21": _possible_at_dte(day_frame, 21),
+        "would_exit_be_possible_at_dte14": _possible_at_dte(day_frame, 14),
+        "would_exit_be_possible_at_dte7": _possible_at_dte(day_frame, 7),
+    }
+    compact_buckets = []
+    for row in bucket_rows:
+        row = row.copy()
+        row.pop("day_frame", None)
+        compact_buckets.append(row)
+    return detail, compact_buckets
+
+
+def _bucket_availability(pos: dict[str, Any], relevant: pd.DataFrame, expiry: pd.Timestamp, dte_high: int, dte_low: int, config: dict) -> dict[str, Any]:
+    dates = pd.date_range(expiry - pd.Timedelta(days=dte_high), expiry - pd.Timedelta(days=dte_low), freq="D")
+    rows = []
+    for date in dates:
+        long_quote = _leg_quote(relevant, date, pos["long_put_strike"])
+        short_quote = _leg_quote(relevant, date, pos["short_put_strike"])
+        long_valid = _single_quote_valid(long_quote, config)
+        short_valid = _single_quote_valid(short_quote, config)
+        rows.append(
+            {
+                "date": date,
+                "dte": int((expiry - date).days),
+                "long_valid": long_valid,
+                "short_valid": short_valid,
+                "both_legs_valid": bool(long_valid and short_valid),
+                "long_spread": _quote_float(long_quote, "spread_pct"),
+                "short_spread": _quote_float(short_quote, "spread_pct"),
+                "long_volume": _quote_float(long_quote, "volume"),
+                "short_volume": _quote_float(short_quote, "volume"),
+                "long_oi": _quote_float(long_quote, "open_interest"),
+                "short_oi": _quote_float(short_quote, "open_interest"),
+            }
+        )
+    frame = pd.DataFrame(rows)
+    return {
+        "both_legs_valid_days": int(frame["both_legs_valid"].sum()) if not frame.empty else 0,
+        "long_leg_valid_days": int(frame["long_valid"].sum()) if not frame.empty else 0,
+        "short_leg_valid_days": int(frame["short_valid"].sum()) if not frame.empty else 0,
+        "long_leg_avg_spread": _float_or_blank(pd.to_numeric(frame.get("long_spread", pd.Series(dtype=float)), errors="coerce").mean()),
+        "short_leg_avg_spread": _float_or_blank(pd.to_numeric(frame.get("short_spread", pd.Series(dtype=float)), errors="coerce").mean()),
+        "long_leg_avg_volume": _float_or_blank(pd.to_numeric(frame.get("long_volume", pd.Series(dtype=float)), errors="coerce").mean()),
+        "short_leg_avg_volume": _float_or_blank(pd.to_numeric(frame.get("short_volume", pd.Series(dtype=float)), errors="coerce").mean()),
+        "long_leg_avg_oi": _float_or_blank(pd.to_numeric(frame.get("long_oi", pd.Series(dtype=float)), errors="coerce").mean()),
+        "short_leg_avg_oi": _float_or_blank(pd.to_numeric(frame.get("short_oi", pd.Series(dtype=float)), errors="coerce").mean()),
+        "day_frame": frame,
+    }
+
+
+def _single_quote_valid(quote: dict[str, Any] | None, config: dict) -> bool:
+    if quote is None:
+        return False
+    min_volume = float(config.get("wide_spread_volume_threshold", 50))
+    min_oi = float(config.get("min_open_interest", 100))
+    return bool(
+        str(quote.get("quote_quality_status", "")) == "VALID"
+        and _quote_bool(quote, "is_tradable_quote") is True
+        and float(quote.get("volume", 0.0)) >= min_volume
+        and float(quote.get("open_interest", 0.0)) >= min_oi
+    )
+
+
+def _possible_at_dte(day_frame: pd.DataFrame, dte: int) -> bool:
+    if day_frame.empty:
+        return False
+    exact = day_frame[pd.to_numeric(day_frame["dte"], errors="coerce") == dte]
+    return bool(not exact.empty and exact["both_legs_valid"].astype(bool).any())
+
+
+def _exit_timing_aggregate_rows(position_rows: pd.DataFrame, bucket_rows: pd.DataFrame) -> list[dict[str, Any]]:
+    if position_rows.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    dte_values = pd.to_numeric(position_rows["dte_at_last_day_both_legs_valid"], errors="coerce").dropna()
+    forced = position_rows[position_rows["forced_unfilled_exit"].astype(bool)].copy()
+    forced_too_late = forced[forced["whether_current_dte14_exit_is_too_late"].astype(bool)] if not forced.empty else pd.DataFrame()
+    too_late_all = position_rows[position_rows["whether_current_dte14_exit_is_too_late"].astype(bool)]
+    rows.extend(
+        [
+            {"section": "aggregate", "metric": "forced_exits_with_last_valid_exit_before_dte14", "value": int(len(forced_too_late))},
+            {"section": "aggregate", "metric": "median_dte_at_last_valid_full_exit", "value": _float_or_blank(dte_values.median())},
+            {"section": "aggregate", "metric": "average_dte_at_last_valid_full_exit", "value": _float_or_blank(dte_values.mean())},
+            {
+                "section": "aggregate",
+                "metric": "percentage_positions_where_dte14_exit_is_too_late",
+                "value": _safe_ratio(len(too_late_all), len(position_rows)),
+            },
+            {
+                "section": "aggregate",
+                "metric": "forced_exit_dte14_too_late_ratio",
+                "value": _safe_ratio(len(forced_too_late), len(forced)),
+            },
+        ]
+    )
+    for status, group in [("forced", forced), ("normal", position_rows[~position_rows["forced_unfilled_exit"].astype(bool)])]:
+        values = pd.to_numeric(group["dte_at_last_day_both_legs_valid"], errors="coerce").dropna()
+        rows.append({"section": "forced_vs_normal_summary", "position_status": status, "position_count": int(len(group)), "median_dte_at_last_valid_full_exit": _float_or_blank(values.median()), "average_dte_at_last_valid_full_exit": _float_or_blank(values.mean())})
+    for dte in [30, 21, 14, 7]:
+        col = f"would_exit_be_possible_at_dte{dte}"
+        rows.append({"section": "hypothetical_exit_availability", "dte": dte, "possible_count": int(position_rows[col].astype(bool).sum()), "position_count": int(len(position_rows)), "possible_ratio": _safe_ratio(int(position_rows[col].astype(bool).sum()), len(position_rows))})
+    return rows
+
+
+def _exit_timing_markdown(analysis: pd.DataFrame) -> str:
+    aggregate = analysis[analysis["section"] == "aggregate"] if not analysis.empty else pd.DataFrame()
+    hypo = analysis[analysis["section"] == "hypothetical_exit_availability"] if not analysis.empty else pd.DataFrame()
+    forced_normal = analysis[analysis["section"] == "forced_vs_normal_summary"] if not analysis.empty else pd.DataFrame()
+    lines = [
+        "# Exit Timing Diagnostic",
+        "",
+        "This diagnostic checks quote availability only. It does not create exits, recalculate PnL, modify DTE rules, or choose an exit DTE.",
+        "",
+        "## Aggregate",
+        "",
+    ]
+    if aggregate.empty:
+        lines.append("- No aggregate rows.")
+    else:
+        for row in aggregate.itertuples(index=False):
+            lines.append(f"- {row.metric}: {row.value}")
+    lines.extend(["", "## Hypothetical Exit Availability", ""])
+    if hypo.empty:
+        lines.append("- Unavailable.")
+    else:
+        for row in hypo.itertuples(index=False):
+            lines.append(f"- DTE {int(row.dte)}: {row.possible_count}/{row.position_count} = {row.possible_ratio}")
+    lines.extend(["", "## Forced vs Normal", ""])
+    if forced_normal.empty:
+        lines.append("- Unavailable.")
+    else:
+        for row in forced_normal.itertuples(index=False):
+            lines.append(
+                f"- {row.position_status}: positions={row.position_count}, "
+                f"median_last_valid_dte={row.median_dte_at_last_valid_full_exit}, "
+                f"avg_last_valid_dte={row.average_dte_at_last_valid_full_exit}"
+            )
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This report only judges quote availability.",
+            "- It does not choose or rank any DTE threshold or parameter change.",
+            "- It does not alter trades, exits, fills, quote gates, or strategy rules.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+EXIT_TIMING_VARIANTS = {
+    "quarterly_base_insurance_exit_dte30": 31,
+    "quarterly_base_insurance_exit_dte21": 22,
+    "quarterly_base_insurance_exit_dte14": 14,
+}
+
+
+def _run_single_variant_engine(
+    label: str,
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+    engine_variant: str = "quarterly_base_insurance",
+) -> dict[str, Any]:
+    engine = PutSpreadVariantStateMachine(
+        market,
+        options,
+        portfolio,
+        config,
+        put_params,
+        ic_params,
+        mode="put_spread_only",
+        variant_name=engine_variant,
+    )
+    equity, trades = engine.run()
+    return {
+        "variant": label,
+        "equity": equity,
+        "trades": trades,
+        "lifecycle": pd.DataFrame(equity.attrs.get("position_lifecycle_events", [])),
+        "filter_events": pd.DataFrame(engine.feasibility_filter_events),
+        "put_params": put_params.copy(),
+    }
+
+
+def _run_exit_timing_variant_engines(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    for label, internal_exit_dte in EXIT_TIMING_VARIANTS.items():
+        local_put_params = put_params.copy()
+        local_put_params["exit_dte"] = internal_exit_dte
+        runs.append(_run_single_variant_engine(label, market, options, portfolio, config, local_put_params, ic_params))
+    return runs
+
+
+def _run_exit_timing_variants(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> pd.DataFrame:
+    return _exit_timing_variant_comparison_from_runs(
+        _run_exit_timing_variant_engines(market, options, portfolio, config, put_params, ic_params),
+        market,
+        config,
+    )
+
+
+def _exit_timing_variant_comparison_from_runs(runs: list[dict[str, Any]], market: pd.DataFrame, config: dict) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        label = str(run["variant"])
+        equity = run["equity"]
+        trades = run["trades"]
+        lifecycle = run["lifecycle"]
+        rows.extend(_exit_variant_summary_rows(label, equity, trades, lifecycle))
+        rows.extend(_exit_variant_annual_rows(label, equity, trades, config))
+        rows.extend(_exit_variant_crash_rows(label, trades, lifecycle, market))
+        rows.extend(_exit_variant_dte_distribution_rows(label, trades))
+        rows.extend(_exit_variant_audit_rows(label, trades))
+    return pd.DataFrame(rows)
+
+
+def _exit_variant_summary_rows(variant: str, equity: pd.DataFrame, trades: pd.DataFrame, lifecycle: pd.DataFrame) -> list[dict[str, Any]]:
+    positions = _position_metadata(variant, trades, lifecycle)
+    position_count = len(positions)
+    forced_count = int(sum(bool(pos["forced_unfilled_exit"]) for pos in positions))
+    normal_count = int(sum(bool(pos["normal_exit"]) for pos in positions))
+    days_held = []
+    for pos in positions:
+        entry = pd.to_datetime(pos["entry_date"], errors="coerce")
+        exit_date = pd.to_datetime(pos["exit_date"], errors="coerce")
+        if pd.notna(entry) and pd.notna(exit_date):
+            days_held.append((exit_date - entry).days)
+    return [
+        {
+            "section": "exit_variant_summary",
+            "variant": variant,
+            "position_count": position_count,
+            "forced_unfilled_exit_count": forced_count,
+            "forced_unfilled_exit_rate": _safe_ratio(forced_count, position_count),
+            "normal_exit_count": normal_count,
+            "realized_hedge_pnl": float(trades["cash_flow"].sum()) if not trades.empty else 0.0,
+            "average_days_held": _float_or_blank(np.mean(days_held)) if days_held else "",
+            "median_days_held": _float_or_blank(np.median(days_held)) if days_held else "",
+        }
+    ]
+
+
+def _exit_variant_annual_rows(variant: str, equity: pd.DataFrame, trades: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
+    annual_rows = _annual_budget_rows(variant, equity, trades, config)
+    out = []
+    for row in annual_rows:
+        if row.get("section") == "annual_budget_usage":
+            out.append({**row, "section": "exit_variant_annual_hedge_cost"})
+        elif row.get("check") == "annual_budget_breach":
+            detail = str(row.get("detail", "years=0"))
+            count = int(detail.split("years=", 1)[1]) if "years=" in detail else 0
+            out.append({"section": "exit_variant_audit", "variant": variant, "check": "annual_budget_breach_count", "status": row.get("status"), "count": count})
+    return out
+
+
+def _exit_variant_crash_rows(variant: str, trades: pd.DataFrame, lifecycle: pd.DataFrame, market: pd.DataFrame) -> list[dict[str, Any]]:
+    positions = _position_windows(trades, lifecycle)
+    mk = market.copy()
+    mk["date"] = pd.to_datetime(mk["date"], errors="coerce")
+    rows = []
+    for period, (start_text, end_text) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        end = pd.Timestamp(end_text)
+        market_window = mk[(mk["date"] >= start) & (mk["date"] <= end)]
+        active = [pos for pos in positions if pos["entry_date"] <= end and pos["exit_date"] >= start]
+        exited_before = [pos for pos in positions if pos["entry_date"] < start and pos["exit_date"] < start]
+        total_days = int(market_window["date"].nunique()) if not market_window.empty else 0
+        covered_days = _covered_days(active, start, end, market_window["date"] if not market_window.empty else pd.Series(dtype="datetime64[ns]"))
+        rows.append(
+            {
+                "section": "exit_variant_crash_window",
+                "variant": variant,
+                "period": period,
+                "crash_coverage_ratio": _safe_ratio(covered_days, total_days),
+                "crash_coverage_days": covered_days,
+                "positions_exited_before_crash_window_count": int(len(exited_before)),
+                "positions_active_during_crash_window_count": int(len(active)),
+            }
+        )
+    return rows
+
+
+def _exit_variant_dte_distribution_rows(variant: str, trades: pd.DataFrame) -> list[dict[str, Any]]:
+    if trades.empty:
+        return []
+    exits = trades[~trades["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)].copy()
+    if exits.empty or "dte_at_trade" not in exits:
+        return []
+    dte = pd.to_numeric(exits["dte_at_trade"], errors="coerce").dropna()
+    if dte.empty:
+        return []
+    buckets = pd.cut(dte, bins=[-1, 7, 14, 21, 30, 10_000], labels=["0_7", "8_14", "15_21", "22_30", "gt_30"])
+    return [{"section": "exit_dte_distribution", "variant": variant, "dte_bucket": str(bucket), "count": int(count)} for bucket, count in buckets.value_counts().sort_index().items()]
+
+
+def _exit_variant_audit_rows(variant: str, trades: pd.DataFrame) -> list[dict[str, Any]]:
+    if trades.empty:
+        return [
+            {"section": "exit_variant_audit", "variant": variant, "check": "non_valid_quote_trades_count", "count": 0, "status": "PASS"},
+            {"section": "exit_variant_audit", "variant": variant, "check": "trade_date_after_expiry_count", "count": 0, "status": "PASS"},
+        ]
+    status = trades.get("quote_quality_status", pd.Series(["UNKNOWN"] * len(trades))).fillna("UNKNOWN").astype(str)
+    non_valid = int((status != "VALID").sum())
+    trade_date = pd.to_datetime(trades["date"], errors="coerce")
+    expiry = pd.to_datetime(trades["expiry"], errors="coerce")
+    after = int((trade_date > expiry).sum())
+    return [
+        {"section": "exit_variant_audit", "variant": variant, "check": "non_valid_quote_trades_count", "count": non_valid, "status": "FAIL" if non_valid else "PASS"},
+        {"section": "exit_variant_audit", "variant": variant, "check": "trade_date_after_expiry_count", "count": after, "status": "FAIL" if after else "PASS"},
+    ]
+
+
+def _exit_variant_markdown(comparison: pd.DataFrame) -> str:
+    summary = comparison[comparison["section"] == "exit_variant_summary"] if not comparison.empty else pd.DataFrame()
+    crash = comparison[comparison["section"] == "exit_variant_crash_window"] if not comparison.empty else pd.DataFrame()
+    annual = comparison[comparison["section"] == "exit_variant_annual_hedge_cost"] if not comparison.empty else pd.DataFrame()
+    audit = comparison[comparison["section"] == "exit_variant_audit"] if not comparison.empty else pd.DataFrame()
+    lines = [
+        "# Exit Timing Variant Comparison",
+        "",
+        "This report compares fixed early-exit timing variants. It does not rank variants, choose thresholds, or change execution logic.",
+        "",
+        "## Summary",
+        "",
+    ]
+    if summary.empty:
+        lines.append("- No summary rows.")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.variant}: positions={row.position_count}, forced={row.forced_unfilled_exit_count}, "
+                f"forced_rate={row.forced_unfilled_exit_rate}, normal={row.normal_exit_count}, "
+                f"avg_days={row.average_days_held}, median_days={row.median_days_held}"
+            )
+    lines.extend(["", "## Crash Coverage", ""])
+    if crash.empty:
+        lines.append("- Unavailable.")
+    else:
+        for variant in EXIT_TIMING_VARIANTS:
+            sub = crash[crash["variant"] == variant]
+            parts = ", ".join(f"{row.period}={row.crash_coverage_ratio}" for row in sub.itertuples(index=False))
+            lines.append(f"- {variant}: {parts}")
+    lines.extend(["", "## Annual Hedge Cost", ""])
+    if annual.empty:
+        lines.append("- None.")
+    else:
+        for variant in EXIT_TIMING_VARIANTS:
+            sub = annual[annual["variant"] == variant]
+            total = pd.to_numeric(sub["annual_hedge_cost"], errors="coerce").sum()
+            lines.append(f"- {variant}: total={total}")
+    lines.extend(["", "## Audit", ""])
+    if audit.empty:
+        lines.append("- None.")
+    else:
+        for row in audit.itertuples(index=False):
+            lines.append(f"- {row.variant}.{row.check}: {row.status} count={row.count}")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This report does not choose or rank any exit timing.",
+            "- It does not modify the original quarterly_base_insurance, current_signal_based, or base_plus_signal_boost variants.",
+            "- It does not change fills, quote gates, moneyness, entry DTE range, or annual budget.",
+            "- It is not an investment conclusion.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _rolling_coverage_gap_analysis(
+    runs: list[dict[str, Any]],
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    timelines: dict[str, pd.DataFrame] = {}
+    opportunities: dict[str, pd.DataFrame] = {}
+    for run in runs:
+        variant = str(run["variant"])
+        trades = run["trades"]
+        lifecycle = run["lifecycle"]
+        timeline = _coverage_timeline_rows(variant, trades, lifecycle, market)
+        timelines[variant] = timeline
+        if not timeline.empty:
+            rows.extend(timeline.to_dict("records"))
+        rows.extend(_gap_summary_rows(variant, timeline))
+        run_put_params = run.get("put_params", put_params)
+        opp = _entry_opportunity_after_exit_rows(variant, trades, lifecycle, market, options, config, run_put_params)
+        opportunities[variant] = opp
+        if not opp.empty:
+            rows.extend(opp.to_dict("records"))
+    for run in runs:
+        variant = str(run["variant"])
+        rows.extend(_crash_pre_window_rows(variant, timelines.get(variant, pd.DataFrame()), opportunities.get(variant, pd.DataFrame()), market))
+    return pd.DataFrame(rows)
+
+
+def _coverage_timeline_rows(variant: str, trades: pd.DataFrame, lifecycle: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    mk = market.copy()
+    if mk.empty:
+        return pd.DataFrame()
+    mk["date"] = pd.to_datetime(mk["date"], errors="coerce")
+    mk = mk.dropna(subset=["date"]).sort_values("date")
+    positions = _position_windows(trades, lifecycle)
+    exits = sorted([pos["exit_date"] for pos in positions if pd.notna(pos.get("exit_date"))])
+    entries = sorted([pos["entry_date"] for pos in positions if pd.notna(pos.get("entry_date"))])
+    rows: list[dict[str, Any]] = []
+    for date in mk["date"]:
+        active = [pos for pos in positions if pd.notna(pos["entry_date"]) and pd.notna(pos["exit_date"]) and pos["entry_date"] <= date <= pos["exit_date"]]
+        last_exit = max([x for x in exits if x < date], default=pd.NaT)
+        next_entry = min([x for x in entries if x > date], default=pd.NaT)
+        crash_label = _crash_label(date)
+        expiry_values = [pd.Timestamp(pos["expiry"]) for pos in active if pd.notna(pos.get("expiry"))]
+        min_expiry = min(expiry_values) if expiry_values else pd.NaT
+        rows.append(
+            {
+                "section": "coverage_timeline",
+                "date": str(date.date()),
+                "variant": variant,
+                "has_active_put_spread": bool(active),
+                "active_position_id": ";".join(str(pos["position_id"]) for pos in active),
+                "position_expiry": str(min_expiry.date()) if pd.notna(min_expiry) else "",
+                "days_to_expiry": int((min_expiry - date).days) if pd.notna(min_expiry) else "",
+                "days_since_last_exit": int((date - last_exit).days) if pd.notna(last_exit) else "",
+                "days_until_next_entry": int((next_entry - date).days) if pd.notna(next_entry) else "",
+                "in_crash_window": bool(crash_label),
+                "crash_window_label": crash_label,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _gap_summary_rows(variant: str, timeline: pd.DataFrame) -> list[dict[str, Any]]:
+    if timeline.empty:
+        return [{"section": "gap_summary", "variant": variant, "total_days": 0, "covered_days": 0, "uncovered_days": 0, "coverage_ratio": ""}]
+    active = timeline["has_active_put_spread"].astype(bool).reset_index(drop=True)
+    total_days = int(len(active))
+    covered_days = int(active.sum())
+    gaps: list[int] = []
+    current = 0
+    for is_active in active:
+        if is_active:
+            if current:
+                gaps.append(current)
+                current = 0
+        else:
+            current += 1
+    if current:
+        gaps.append(current)
+    return [
+        {
+            "section": "gap_summary",
+            "variant": variant,
+            "total_days": total_days,
+            "covered_days": covered_days,
+            "uncovered_days": total_days - covered_days,
+            "coverage_ratio": _safe_ratio(covered_days, total_days),
+            "longest_uncovered_gap_days": max(gaps) if gaps else 0,
+            "average_uncovered_gap_days": _float_or_blank(np.mean(gaps)) if gaps else 0,
+            "median_uncovered_gap_days": _float_or_blank(np.median(gaps)) if gaps else 0,
+            "number_of_gaps_gt_30d": int(sum(g > 30 for g in gaps)),
+            "number_of_gaps_gt_60d": int(sum(g > 60 for g in gaps)),
+            "number_of_gaps_gt_90d": int(sum(g > 90 for g in gaps)),
+            "number_of_gaps_gt_180d": int(sum(g > 180 for g in gaps)),
+        }
+    ]
+
+
+def _entry_opportunity_after_exit_rows(
+    variant: str,
+    trades: pd.DataFrame,
+    lifecycle: pd.DataFrame,
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+) -> pd.DataFrame:
+    positions = _position_windows(trades, lifecycle)
+    if not positions:
+        return pd.DataFrame()
+    mk = market.copy()
+    mk["date"] = pd.to_datetime(mk["date"], errors="coerce")
+    mk = mk.dropna(subset=["date"]).sort_values("date")
+    timeline = _coverage_timeline_rows(variant, trades, lifecycle, market)
+    active_by_date = dict(zip(pd.to_datetime(timeline["date"], errors="coerce"), timeline["has_active_put_spread"].astype(bool))) if not timeline.empty else {}
+    first_quarter_dates = _first_market_dates_by_quarter(mk["date"])
+    selector = ContractSelector(options, config)
+    rows: list[dict[str, Any]] = []
+    for pos in positions:
+        exit_date = pd.Timestamp(pos["exit_date"])
+        if pd.isna(exit_date):
+            continue
+        window = mk[(mk["date"] > exit_date) & (mk["date"] <= exit_date + pd.Timedelta(days=90))]
+        for row in window.itertuples(index=False):
+            date = pd.Timestamp(row.date)
+            if bool(active_by_date.get(date, False)):
+                continue
+            schedule_due = date in first_quarter_dates
+            reason = "ENTRY_SCHEDULE_GAP"
+            can_build = False
+            if schedule_due:
+                can_build, reason = _entry_candidate_available(row, selector, config, put_params)
+            rows.append(
+                {
+                    "section": "entry_opportunity_after_exit",
+                    "variant": variant,
+                    "position_id": pos["position_id"],
+                    "exit_date": str(exit_date.date()),
+                    "date": str(date.date()),
+                    "days_after_exit": int((date - exit_date).days),
+                    "schedule_due": bool(schedule_due),
+                    "can_build_next": bool(can_build),
+                    "block_reason": "" if can_build else reason,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _crash_pre_window_rows(variant: str, timeline: pd.DataFrame, opportunities: pd.DataFrame, market: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if timeline.empty:
+        return rows
+    tl = timeline.copy()
+    tl["date_ts"] = pd.to_datetime(tl["date"], errors="coerce")
+    mk = market.copy()
+    mk["date"] = pd.to_datetime(mk["date"], errors="coerce")
+    for period, (start_text, end_text) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        pre_start = start - pd.Timedelta(days=180)
+        pre = tl[(tl["date_ts"] >= pre_start) & (tl["date_ts"] < start)]
+        covered_days = int(pre["has_active_put_spread"].astype(bool).sum()) if not pre.empty else 0
+        uncovered_days = int(len(pre) - covered_days)
+        before = tl[tl["date_ts"] < start]
+        after = tl[tl["date_ts"] > start]
+        last_exit_values = pd.to_numeric(before["days_since_last_exit"], errors="coerce")
+        last_exit_date = ""
+        if not before.empty and last_exit_values.notna().any():
+            idx = last_exit_values.idxmin()
+            if pd.notna(before.loc[idx, "date_ts"]):
+                last_exit_date = str((before.loc[idx, "date_ts"] - pd.Timedelta(days=int(before.loc[idx, "days_since_last_exit"]))).date())
+        next_entry_date = ""
+        next_entry_values = pd.to_numeric(after["days_until_next_entry"], errors="coerce")
+        if not after.empty and next_entry_values.notna().any():
+            idx = next_entry_values.idxmin()
+            if pd.notna(after.loc[idx, "date_ts"]):
+                next_entry_date = str((after.loc[idx, "date_ts"] + pd.Timedelta(days=int(after.loc[idx, "days_until_next_entry"]))).date())
+        start_row = tl[tl["date_ts"] >= start].head(1)
+        active_at_start = bool(start_row["has_active_put_spread"].iloc[0]) if not start_row.empty else False
+        reason = "" if active_at_start else _no_active_reason(start, opportunities)
+        market_window = mk[(mk["date"] >= pd.Timestamp(start_text)) & (mk["date"] <= pd.Timestamp(end_text))]
+        rows.append(
+            {
+                "section": "crash_pre_window_coverage",
+                "variant": variant,
+                "crash_window_label": period,
+                "crash_start": start_text,
+                "crash_end": end_text,
+                "covered_days": covered_days,
+                "uncovered_days": uncovered_days,
+                "coverage_ratio": _safe_ratio(covered_days, len(pre)),
+                "last_exit_before_crash": last_exit_date,
+                "next_entry_after_crash": next_entry_date,
+                "gap_from_last_exit_to_crash_start": int((start - pd.Timestamp(last_exit_date)).days) if last_exit_date else "",
+                "reason_no_active_insurance_at_crash_start": reason,
+                "max_drawdown": max_drawdown(market_window["tx_close"]) if not market_window.empty and "tx_close" in market_window else "",
+            }
+        )
+    return rows
+
+
+def _entry_candidate_available(row, selector: ContractSelector, config: dict, put_params: dict) -> tuple[bool, str]:
+    date = pd.Timestamp(row.date)
+    dte_min = int(put_params.get("target_dte_min", 60))
+    dte_max = int(put_params.get("target_dte_max", 120))
+    low_vix = pd.notna(getattr(row, "vix_percentile_3y", np.nan)) and float(getattr(row, "vix_percentile_3y", np.nan)) < 20.0
+    long_m = float(put_params.get("long_put_moneyness_low_vix" if low_vix else "long_put_moneyness", 0.90))
+    short_m = float(put_params.get("short_put_moneyness_low_vix" if low_vix else "short_put_moneyness", 0.75))
+    chain = selector.chain(date)
+    if chain.empty:
+        return False, "NO_CONTRACT_FOUND"
+    puts = chain[(chain["cp"] == "P") & (chain["dte"].between(dte_min, dte_max))]
+    if puts.empty:
+        return False, "NO_CONTRACT_FOUND"
+    long_put = selector.nearest_strike(date, "P", float(row.txf_close) * long_m, dte_min, dte_max)
+    if long_put is None:
+        return False, _candidate_block_reason(puts)
+    short_put = selector.nearest_strike(date, "P", float(row.txf_close) * short_m, dte_min, dte_max, expiry=pd.Timestamp(long_put.expiry))
+    if short_put is None or short_put.strike >= long_put.strike:
+        same_expiry = puts[puts["expiry"] == pd.Timestamp(long_put.expiry)]
+        return False, _candidate_block_reason(same_expiry if not same_expiry.empty else puts)
+    return True, ""
+
+
+def _candidate_block_reason(pool: pd.DataFrame) -> str:
+    if pool.empty:
+        return "NO_CONTRACT_FOUND"
+    if "quote_quality_status" in pool and (pool["quote_quality_status"].astype(str) != "VALID").any():
+        return "QUOTE_NOT_VALID"
+    volume = pd.to_numeric(pool.get("volume", pd.Series(dtype=float)), errors="coerce")
+    oi = pd.to_numeric(pool.get("open_interest", pd.Series(dtype=float)), errors="coerce")
+    if (volume.fillna(0) <= 0).any() or (oi.fillna(0) <= 0).any():
+        return "LOW_LIQUIDITY"
+    return "UNKNOWN"
+
+
+def _first_market_dates_by_quarter(dates: pd.Series) -> set[pd.Timestamp]:
+    clean = pd.to_datetime(dates, errors="coerce").dropna().sort_values()
+    return set(clean.groupby(clean.dt.to_period("Q")).first().tolist())
+
+
+def _crash_label(date: pd.Timestamp) -> str:
+    for label, (start, end) in CRASH_WINDOWS.items():
+        if pd.Timestamp(start) <= date <= pd.Timestamp(end):
+            return label
+    return ""
+
+
+def _no_active_reason(crash_start: pd.Timestamp, opportunities: pd.DataFrame) -> str:
+    if opportunities.empty:
+        return "NO_NEXT_ENTRY"
+    opp = opportunities.copy()
+    opp["date_ts"] = pd.to_datetime(opp["date"], errors="coerce")
+    pre = opp[(opp["date_ts"] >= crash_start - pd.Timedelta(days=180)) & (opp["date_ts"] < crash_start)]
+    scheduled = pre[pre["schedule_due"].astype(bool)] if not pre.empty and "schedule_due" in pre else pd.DataFrame()
+    blocked = scheduled[~scheduled["can_build_next"].astype(bool)] if not scheduled.empty else pd.DataFrame()
+    if not blocked.empty:
+        return str(blocked.sort_values("date_ts").iloc[-1].get("block_reason", "UNKNOWN")) or "UNKNOWN"
+    if not scheduled.empty:
+        return "NO_NEXT_ENTRY"
+    return "ENTRY_SCHEDULE_GAP"
+
+
+def _rolling_coverage_markdown(diagnostic: pd.DataFrame) -> str:
+    summary = diagnostic[diagnostic["section"] == "gap_summary"] if not diagnostic.empty else pd.DataFrame()
+    crash = diagnostic[diagnostic["section"] == "crash_pre_window_coverage"] if not diagnostic.empty else pd.DataFrame()
+    reasons = crash["reason_no_active_insurance_at_crash_start"].value_counts() if not crash.empty and "reason_no_active_insurance_at_crash_start" in crash else pd.Series(dtype=int)
+    lines = [
+        "# Rolling Coverage Gap Analysis",
+        "",
+        "This report explains insurance coverage gaps from existing fixed variants and diagnostics. It does not change rules or rank variants.",
+        "",
+        "## Gap Summary",
+        "",
+    ]
+    if summary.empty:
+        lines.append("- No gap summary rows.")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.variant}: coverage_ratio={row.coverage_ratio}, "
+                f"longest_uncovered_gap_days={row.longest_uncovered_gap_days}, "
+                f"gaps_gt_180d={row.number_of_gaps_gt_180d}"
+            )
+    lines.extend(["", "## Crash Pre-Window Reasons", ""])
+    if reasons.empty:
+        lines.append("- None.")
+    else:
+        for reason, count in reasons.items():
+            label = reason if reason else "ACTIVE_AT_START"
+            lines.append(f"- {label}: {int(count)}")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This audit explains coverage gaps only.",
+            "- It does not modify quarterly scheduling, DTE exits, moneyness, budgets, quote gates, or fills.",
+            "- It does not infer rules from crash windows.",
+            "- It is not an investment conclusion.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+MONEYNESS_SETS = {
+    "A_standard": (0.90, 0.75),
+    "B_closer": (0.93, 0.78),
+    "C_farther": (0.88, 0.70),
+    "D_mid": (0.90, 0.80),
+}
+
+
+def _run_moneyness_tradability_diagnostic(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> pd.DataFrame:
+    return _moneyness_tradability_from_runs(
+        _run_moneyness_variant_engines(market, options, portfolio, config, put_params, ic_params),
+        options,
+        config,
+    )
+
+
+def _run_moneyness_variant_engines(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    quarterly_checks = _infer_quarterly_check_count(market)
+    for label, (long_m, short_m) in MONEYNESS_SETS.items():
+        local_put_params = put_params.copy()
+        local_put_params["long_put_moneyness"] = long_m
+        local_put_params["long_put_moneyness_low_vix"] = long_m
+        local_put_params["short_put_moneyness"] = short_m
+        local_put_params["short_put_moneyness_low_vix"] = short_m
+        run = _run_single_variant_engine(label, market, options, portfolio, config, local_put_params, ic_params)
+        run["long_put_moneyness"] = long_m
+        run["short_put_moneyness"] = short_m
+        run["quarterly_check_count"] = quarterly_checks
+        runs.append(run)
+    return runs
+
+
+def _moneyness_tradability_from_runs(runs: list[dict[str, Any]], options: pd.DataFrame, config: dict) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        label = str(run["variant"])
+        equity = run["equity"]
+        trades = run["trades"]
+        lifecycle = run["lifecycle"]
+        timing = _exit_timing_diagnostic(
+            [{"variant": label, "trades": trades, "lifecycle": lifecycle}],
+            options,
+            config,
+            {},
+        )
+        rows.extend(
+            _moneyness_summary_rows(
+                label,
+                float(run.get("long_put_moneyness", np.nan)),
+                float(run.get("short_put_moneyness", np.nan)),
+                trades,
+                lifecycle,
+                timing,
+                int(run.get("quarterly_check_count", _infer_quarterly_check_count(equity))),
+                equity,
+                config,
+                options,
+            )
+        )
+        rows.extend(_moneyness_crash_rows(label, trades, lifecycle, equity))
+        rows.extend(_moneyness_audit_rows(label, equity, trades, config))
+    return pd.DataFrame(rows)
+
+
+def _infer_quarterly_check_count(frame: pd.DataFrame) -> int:
+    if frame.empty or "date" not in frame:
+        return 0
+    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+    return int(dates.dt.to_period("Q").nunique())
+
+
+def _moneyness_summary_rows(
+    label: str,
+    long_m: float,
+    short_m: float,
+    trades: pd.DataFrame,
+    lifecycle: pd.DataFrame,
+    timing: pd.DataFrame,
+    quarterly_checks: int,
+    equity: pd.DataFrame,
+    config: dict,
+    options: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    positions = _position_metadata(label, trades, lifecycle)
+    position_count = len(positions)
+    forced_count = int(sum(bool(pos["forced_unfilled_exit"]) for pos in positions))
+    entry_legs = _entry_legs(trades)
+    valid_entry_positions = _both_entry_legs_valid_by_position(entry_legs)
+    spread = pd.to_numeric(entry_legs.get("spread_pct", pd.Series(dtype=float)), errors="coerce") if not entry_legs.empty else pd.Series(dtype=float)
+    entry_quote_stats = _entry_quote_volume_oi_stats(positions, options)
+    timing_agg = timing[timing["section"] == "aggregate"] if not timing.empty else pd.DataFrame()
+    hypo = timing[timing["section"] == "hypothetical_exit_availability"] if not timing.empty else pd.DataFrame()
+    return [
+        {
+            "section": "moneyness_summary",
+            "moneyness_set": label,
+            "long_put_moneyness": long_m,
+            "short_put_moneyness": short_m,
+            "quarterly_check_count": quarterly_checks,
+            "position_count": position_count,
+            "candidate_found_rate": _safe_ratio(position_count, quarterly_checks),
+            "both_legs_valid_at_entry_rate": _safe_ratio(valid_entry_positions, position_count),
+            "average_entry_spread_pct": _float_or_blank(spread.mean()),
+            "median_entry_volume": entry_quote_stats["median_entry_volume"],
+            "median_entry_oi": entry_quote_stats["median_entry_oi"],
+            "forced_unfilled_exit_count": forced_count,
+            "forced_unfilled_exit_rate": _safe_ratio(forced_count, position_count),
+            "last_valid_full_spread_exit_dte_median": _metric_value(timing_agg, "median_dte_at_last_valid_full_exit"),
+            "exit_quote_availability_dte30": _hypo_ratio(hypo, 30),
+            "exit_quote_availability_dte21": _hypo_ratio(hypo, 21),
+            "exit_quote_availability_dte14": _hypo_ratio(hypo, 14),
+            "annual_hedge_cost": _annual_hedge_cost_total(trades),
+        }
+    ]
+
+
+def _moneyness_crash_rows(label: str, trades: pd.DataFrame, lifecycle: pd.DataFrame, market: pd.DataFrame) -> list[dict[str, Any]]:
+    return [
+        {"section": "moneyness_crash_window", "moneyness_set": label, **{k: v for k, v in row.items() if k not in {"section", "variant"}}}
+        for row in _exit_variant_crash_rows(label, trades, lifecycle, market)
+    ]
+
+
+def _moneyness_audit_rows(label: str, equity: pd.DataFrame, trades: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
+    out = [
+        {"section": "moneyness_audit", "moneyness_set": label, **{k: v for k, v in row.items() if k not in {"section", "variant"}}}
+        for row in _exit_variant_audit_rows(label, trades)
+    ]
+    breach = 0
+    for row in _annual_budget_rows(label, equity, trades, config):
+        if row.get("section") == "annual_budget_usage" and bool(row.get("annual_budget_breach", False)):
+            breach += 1
+    out.append({"section": "moneyness_audit", "moneyness_set": label, "check": "annual_budget_breach_count", "count": breach, "status": "FAIL" if breach else "PASS"})
+    return out
+
+
+def _entry_quote_volume_oi_stats(positions: list[dict[str, Any]], options: pd.DataFrame) -> dict[str, Any]:
+    volumes = []
+    oi_values = []
+    opt = options.copy()
+    opt["date"] = pd.to_datetime(opt["date"], errors="coerce")
+    opt["expiry"] = pd.to_datetime(opt["expiry"], errors="coerce")
+    for pos in positions:
+        date = pd.Timestamp(pos["entry_date"])
+        expiry = pd.Timestamp(pos["expiry"])
+        for strike in [pos["long_put_strike"], pos["short_put_strike"]]:
+            quote = _leg_quote(opt[(opt["date"] == date) & (opt["expiry"] == expiry) & (opt["cp"] == "P")], date, float(strike))
+            if quote is not None:
+                volumes.append(_num(quote.get("volume")))
+                oi_values.append(_num(quote.get("open_interest")))
+    return {
+        "median_entry_volume": _float_or_blank(pd.Series(volumes).dropna().median()) if volumes else "",
+        "median_entry_oi": _float_or_blank(pd.Series(oi_values).dropna().median()) if oi_values else "",
+    }
+
+
+def _entry_legs(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+    return trades[trades["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)].copy()
+
+
+def _both_entry_legs_valid_by_position(entry_legs: pd.DataFrame) -> int:
+    if entry_legs.empty:
+        return 0
+    count = 0
+    for _, group in entry_legs.groupby("position_id"):
+        status = group.get("quote_quality_status", pd.Series(dtype=str)).astype(str)
+        tradable = group.get("is_tradable_quote", pd.Series([False] * len(group))).astype(bool)
+        if len(group) >= 2 and status.eq("VALID").all() and tradable.all():
+            count += 1
+    return count
+
+
+def _metric_value(frame: pd.DataFrame, metric: str) -> float | str:
+    if frame.empty or "metric" not in frame:
+        return ""
+    rows = frame[frame["metric"] == metric]
+    if rows.empty:
+        return ""
+    return _float_or_blank(rows["value"].iloc[0])
+
+
+def _hypo_ratio(hypo: pd.DataFrame, dte: int) -> float | str:
+    if hypo.empty or "dte" not in hypo:
+        return ""
+    rows = hypo[pd.to_numeric(hypo["dte"], errors="coerce") == dte]
+    if rows.empty:
+        return ""
+    return _float_or_blank(rows["possible_ratio"].iloc[0])
+
+
+def _annual_hedge_cost_total(trades: pd.DataFrame) -> float:
+    if trades.empty:
+        return 0.0
+    opens = _entry_legs(trades)
+    return float((-opens["cash_flow"].sum())) if not opens.empty else 0.0
+
+
+def _moneyness_markdown(diagnostic: pd.DataFrame) -> str:
+    summary = diagnostic[diagnostic["section"] == "moneyness_summary"] if not diagnostic.empty else pd.DataFrame()
+    crash = diagnostic[diagnostic["section"] == "moneyness_crash_window"] if not diagnostic.empty else pd.DataFrame()
+    audit = diagnostic[diagnostic["section"] == "moneyness_audit"] if not diagnostic.empty else pd.DataFrame()
+    lines = [
+        "# Moneyness Tradability Diagnostic",
+        "",
+        "This report compares fixed Put Spread moneyness sets for tradability only. It does not rank or choose moneyness settings.",
+        "",
+        "## Summary",
+        "",
+    ]
+    if summary.empty:
+        lines.append("- No summary rows.")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.moneyness_set}: candidate_found_rate={row.candidate_found_rate}, "
+                f"entry_valid_rate={row.both_legs_valid_at_entry_rate}, forced_rate={row.forced_unfilled_exit_rate}, "
+                f"last_valid_median_dte={row.last_valid_full_spread_exit_dte_median}, annual_cost={row.annual_hedge_cost}"
+            )
+    lines.extend(["", "## Crash Coverage", ""])
+    if crash.empty:
+        lines.append("- Unavailable.")
+    else:
+        for label in MONEYNESS_SETS:
+            sub = crash[crash["moneyness_set"] == label]
+            parts = ", ".join(f"{row.period}={row.crash_coverage_ratio}" for row in sub.itertuples(index=False))
+            lines.append(f"- {label}: {parts}")
+    lines.extend(["", "## Audit", ""])
+    if audit.empty:
+        lines.append("- None.")
+    else:
+        for row in audit.itertuples(index=False):
+            lines.append(f"- {row.moneyness_set}.{row.check}: {row.status} count={row.count}")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This is a tradability diagnostic table only.",
+            "- It does not choose or rank any moneyness setting.",
+            "- It does not modify strategy config, fills, quote gates, or entry/exit rules.",
+            "- It is not an investment conclusion.",
         ]
     )
     return "\n".join(lines) + "\n"
