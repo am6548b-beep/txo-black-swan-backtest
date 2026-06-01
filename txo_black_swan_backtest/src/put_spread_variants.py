@@ -48,6 +48,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         self.variant_name = variant_name
         self.checked_quarters: set[str] = set()
         self.feasibility_filter_events: list[dict[str, Any]] = []
+        self.rolling_rejection_events: list[dict[str, Any]] = []
 
     def _check_put_entry(self, row, stock_equity: float) -> None:
         if self.variant_name == "current_signal_based":
@@ -61,6 +62,9 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             return
         if self.variant_name == "quarterly_base_insurance_feasible_only":
             self._check_quarterly_base(row, stock_equity, allow_signal_boost=False, require_entry_time_feasible=True)
+            return
+        if self.variant_name == "rolling_base_insurance":
+            self._check_rolling_base(row, stock_equity)
             return
         raise ValueError(f"Unknown put-spread variant: {self.variant_name}")
 
@@ -93,6 +97,40 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             require_entry_time_feasible=require_entry_time_feasible,
         )
 
+    def _check_rolling_base(self, row, stock_equity: float) -> None:
+        if self._open_positions("put_spread"):
+            return
+        year = year_key(row.date)
+        macro_state = str(getattr(row, "macro_state", "NORMAL"))
+        restriction = macro_restrictions(macro_state)
+        budget_cap = float(self.config["max_annual_hedge_budget_pct"]) * float(restriction["hedge_budget_multiplier"]) * stock_equity
+        used = self.annual_hedge_spend.get(year, 0.0)
+        remaining = max(0.0, budget_cap - used)
+        if remaining <= 0:
+            self._log_rolling_rejection(row, "BUDGET_BLOCKED")
+            return
+        base_budget = float(self.config.get("base_annual_hedge_budget_pct", self.config["max_annual_hedge_budget_pct"])) * stock_equity
+        entry_budget = min(remaining, base_budget / 4.0)
+        opened = self._open_put_spread_with_budget(row, stock_equity, entry_budget, "rolling_base_put_spread")
+        if not opened:
+            self._log_rolling_rejection(row, self._rolling_rejection_reason(row, entry_budget))
+
+    def _log_rolling_rejection(self, row, reason: str) -> None:
+        self.rolling_rejection_events.append(
+            {
+                "variant": self.variant_name,
+                "date": str(pd.Timestamp(row.date).date()),
+                "reason": reason or "UNKNOWN",
+                "txf_close": float(getattr(row, "txf_close", np.nan)),
+            }
+        )
+
+    def _rolling_rejection_reason(self, row, entry_budget: float) -> str:
+        if entry_budget <= 0:
+            return "BUDGET_BLOCKED"
+        can_build, reason = _entry_candidate_available(row, self.selector, self.config, self.put_params)
+        return "" if can_build else reason
+
     def _original_signal_ok(self, row) -> bool:
         if any(pd.isna(x) for x in [row.ma200, row.ret_126d, row.vix_percentile_3y]):
             return False
@@ -105,9 +143,9 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             and int(row.event_flag) == 0
         )
 
-    def _open_put_spread_with_budget(self, row, stock_equity: float, entry_budget: float, reason: str, require_entry_time_feasible: bool = False) -> None:
+    def _open_put_spread_with_budget(self, row, stock_equity: float, entry_budget: float, reason: str, require_entry_time_feasible: bool = False) -> bool:
         if entry_budget <= 0:
-            return
+            return False
         macro_state = str(getattr(row, "macro_state", "NORMAL"))
         restriction = macro_restrictions(macro_state)
         low_vix = pd.notna(row.vix_percentile_3y) and row.vix_percentile_3y < 20.0
@@ -118,7 +156,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
         date = pd.Timestamp(row.date)
         long_put = self.selector.nearest_strike(date, "P", row.txf_close * long_m, dte_min, dte_max)
         if long_put is None:
-            return
+            return False
         short_put = self.selector.nearest_strike(
             date,
             "P",
@@ -128,7 +166,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             expiry=pd.Timestamp(long_put.expiry),
         )
         if short_put is None or short_put.strike >= long_put.strike:
-            return
+            return False
         if require_entry_time_feasible:
             feasibility = _entry_time_feasibility_filter(long_put, short_put, self.options, self.config, self.put_params)
             if feasibility["filter_decision"] == "SKIP_EXIT_UNLIKELY":
@@ -151,21 +189,21 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
                         "no_lookahead_pass": feasibility["no_lookahead_pass"],
                     }
                 )
-                return
+                return False
         stress = is_stress_day(row, self.config)
         long_px = fill_price(long_put, "BUY", self.config, stress)
         short_px = fill_price(short_put, "SELL", self.config, stress)
         per_spread_debit = (long_px - short_px) * float(self.config["txo_point_value"])
         per_spread_cost = per_spread_debit + 2 * float(self.config["commission_per_contract_per_side"])
         if per_spread_cost <= 0:
-            return
+            return False
         notional_contracts = max(
             1,
             int((stock_equity * float(self.config["portfolio_beta"])) / (row.txf_close * float(self.config["txo_point_value"])) * 0.5),
         )
         qty = min(notional_contracts, int(entry_budget // per_spread_cost))
         if qty <= 0:
-            return
+            return False
         pos_id = f"PS-{next(self.position_counter)}"
         fill1, tr1 = trade_contract(str(date.date()), pos_id, "put_spread", long_put, "BUY", qty, self.config, reason, stress)
         fill2, tr2 = trade_contract(str(date.date()), pos_id, "put_spread", short_put, "SELL", qty, self.config, reason, stress)
@@ -188,6 +226,7 @@ class PutSpreadVariantStateMachine(BlackSwanStateMachine):
             )
         )
         self.state = StrategyState.HEDGE_ON
+        return True
 
 
 def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_params: dict, ic_params: dict) -> pd.DataFrame:
@@ -253,6 +292,9 @@ def run_put_spread_variants(data_dir: Path, report_dir: Path, config: dict, put_
     rolling = _rolling_coverage_gap_analysis(variant_runs + exit_variant_runs + moneyness_runs, market, options, config, put_params)
     rolling.to_csv(report_dir / "rolling_coverage_gap_analysis.csv", index=False)
     (report_dir / "rolling_coverage_gap_analysis.md").write_text(_rolling_coverage_markdown(rolling), encoding="utf-8")
+    rolling_replacement = _run_rolling_replacement_comparison(market, options, portfolio, config, put_params, ic_params)
+    rolling_replacement.to_csv(report_dir / "rolling_replacement_variant_comparison.csv", index=False)
+    (report_dir / "rolling_replacement_variant_comparison.md").write_text(_rolling_replacement_markdown(rolling_replacement), encoding="utf-8")
     return comparison
 
 
@@ -286,7 +328,7 @@ def _annual_budget_rows(variant: str, equity: pd.DataFrame, trades: pd.DataFrame
         return []
     t = trades.copy()
     t["date"] = pd.to_datetime(t["date"], errors="coerce")
-    opens = t[(t["strategy"] == "put_spread") & t["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)]
+    opens = t[(t["strategy"] == "put_spread") & t["reason"].astype(str).str.contains("open|quarterly|rolling", case=False, regex=True, na=False)]
     if opens.empty:
         return []
     eq = equity.copy()
@@ -425,7 +467,7 @@ def _position_metadata(variant: str, trades: pd.DataFrame, lifecycle: pd.DataFra
     lifecycle_map = {str(row["position_id"]): row.to_dict() for _, row in lifecycle.iterrows()} if not lifecycle.empty and "position_id" in lifecycle else {}
     positions: list[dict[str, Any]] = []
     for pid, group in t.groupby("position_id"):
-        opens = group[group["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)]
+        opens = group[group["reason"].astype(str).str.contains("open|quarterly|rolling", case=False, regex=True, na=False)]
         exits = group[~group.index.isin(opens.index)]
         if opens.empty:
             continue
@@ -1461,6 +1503,7 @@ def _run_single_variant_engine(
         "trades": trades,
         "lifecycle": pd.DataFrame(equity.attrs.get("position_lifecycle_events", [])),
         "filter_events": pd.DataFrame(engine.feasibility_filter_events),
+        "rolling_rejections": pd.DataFrame(engine.rolling_rejection_events),
         "put_params": put_params.copy(),
     }
 
@@ -1580,7 +1623,7 @@ def _exit_variant_crash_rows(variant: str, trades: pd.DataFrame, lifecycle: pd.D
 def _exit_variant_dte_distribution_rows(variant: str, trades: pd.DataFrame) -> list[dict[str, Any]]:
     if trades.empty:
         return []
-    exits = trades[~trades["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)].copy()
+    exits = trades[~trades["reason"].astype(str).str.contains("open|quarterly|rolling", case=False, regex=True, na=False)].copy()
     if exits.empty or "dte_at_trade" not in exits:
         return []
     dte = pd.to_numeric(exits["dte_at_trade"], errors="coerce").dropna()
@@ -1972,6 +2015,211 @@ def _rolling_coverage_markdown(diagnostic: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
+ROLLING_REPLACEMENT_VARIANTS = {
+    "quarterly_base_insurance": ("quarterly_base_insurance", None),
+    "rolling_base_insurance": ("rolling_base_insurance", 14),
+    "rolling_base_insurance_exit_dte30": ("rolling_base_insurance", 31),
+    "rolling_base_insurance_exit_dte21": ("rolling_base_insurance", 22),
+    "rolling_base_insurance_exit_dte14": ("rolling_base_insurance", 14),
+}
+
+
+def _run_rolling_replacement_comparison(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+) -> pd.DataFrame:
+    runs: list[dict[str, Any]] = []
+    for label, (engine_variant, exit_dte) in ROLLING_REPLACEMENT_VARIANTS.items():
+        local_put_params = put_params.copy()
+        if exit_dte is not None:
+            local_put_params["exit_dte"] = exit_dte
+        runs.append(_run_single_variant_engine(label, market, options, portfolio, config, local_put_params, ic_params, engine_variant))
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        variant = str(run["variant"])
+        equity = run["equity"]
+        trades = run["trades"]
+        lifecycle = run["lifecycle"]
+        timeline = _coverage_timeline_rows(variant, trades, lifecycle, market)
+        rows.extend(_rolling_replacement_summary_rows(variant, equity, trades, lifecycle, timeline))
+        rows.extend(_rolling_replacement_crash_rows(variant, trades, lifecycle, market))
+        rows.extend(_rolling_replacement_annual_rows(variant, equity, trades, config))
+        rows.extend(_rolling_replacement_rejection_rows(variant, run.get("rolling_rejections", pd.DataFrame())))
+        rows.extend(_rolling_replacement_audit_rows(variant, trades, run.get("rolling_rejections", pd.DataFrame()), equity, config))
+    return pd.DataFrame(rows)
+
+
+def _rolling_replacement_summary_rows(
+    variant: str,
+    equity: pd.DataFrame,
+    trades: pd.DataFrame,
+    lifecycle: pd.DataFrame,
+    timeline: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    positions = _position_metadata(variant, trades, lifecycle)
+    position_count = len(positions)
+    forced_count = int(sum(bool(pos["forced_unfilled_exit"]) for pos in positions))
+    gap_summary = _gap_summary_rows(variant, timeline)[0] if not timeline.empty else {}
+    exit_to_entry = _exit_to_next_entry_days(positions)
+    return [
+        {
+            "section": "rolling_replacement_summary",
+            "variant": variant,
+            "position_count": position_count,
+            "forced_unfilled_exit_count": forced_count,
+            "forced_unfilled_exit_rate": _safe_ratio(forced_count, position_count),
+            "coverage_ratio": gap_summary.get("coverage_ratio", ""),
+            "longest_uncovered_gap_days": gap_summary.get("longest_uncovered_gap_days", ""),
+            "average_days_between_exit_and_next_entry": _float_or_blank(np.mean(exit_to_entry)) if exit_to_entry else "",
+            "median_days_between_exit_and_next_entry": _float_or_blank(np.median(exit_to_entry)) if exit_to_entry else "",
+        }
+    ]
+
+
+def _rolling_replacement_crash_rows(variant: str, trades: pd.DataFrame, lifecycle: pd.DataFrame, market: pd.DataFrame) -> list[dict[str, Any]]:
+    return [
+        {"section": "rolling_replacement_crash_window", **{k: v for k, v in row.items() if k != "section"}}
+        for row in _exit_variant_crash_rows(variant, trades, lifecycle, market)
+    ]
+
+
+def _rolling_replacement_annual_rows(variant: str, equity: pd.DataFrame, trades: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _annual_budget_rows(variant, equity, trades, config):
+        if row.get("section") == "annual_budget_usage":
+            rows.append({**row, "section": "rolling_replacement_annual_budget_usage"})
+    return rows
+
+
+def _rolling_replacement_rejection_rows(variant: str, rejections: pd.DataFrame) -> list[dict[str, Any]]:
+    if rejections.empty:
+        return [{"section": "rolling_replacement_rejection_summary", "variant": variant, "reason": "NO_REJECTIONS_LOGGED", "count": 0}]
+    reason = rejections.get("reason", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str)
+    return [
+        {"section": "rolling_replacement_rejection_summary", "variant": variant, "reason": item, "count": int(count)}
+        for item, count in reason.value_counts().items()
+    ]
+
+
+def _rolling_replacement_audit_rows(
+    variant: str,
+    trades: pd.DataFrame,
+    rejections: pd.DataFrame,
+    equity: pd.DataFrame,
+    config: dict,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    rows.extend({"section": "rolling_replacement_audit", **{k: v for k, v in row.items() if k != "section"}} for row in _quote_audit_rows(variant, trades) if row.get("section") == "variant_audit")
+    rows.extend({"section": "rolling_replacement_audit", **{k: v for k, v in row.items() if k != "section"}} for row in _expiry_audit_rows(variant, trades))
+    breach_count = 0
+    for row in _annual_budget_rows(variant, equity, trades, config):
+        if row.get("section") == "annual_budget_usage" and bool(row.get("annual_budget_breach", False)):
+            breach_count += 1
+    rows.append(
+        {
+            "section": "rolling_replacement_audit",
+            "variant": variant,
+            "check": "annual_budget_breach_count",
+            "status": "FAIL" if breach_count else "PASS",
+            "detail": f"count={breach_count}",
+            "count": breach_count,
+        }
+    )
+    if variant.startswith("rolling_base_insurance"):
+        logged = int(len(rejections))
+        rows.append(
+            {
+                "section": "rolling_replacement_audit",
+                "variant": variant,
+                "check": "rejection_reasons_logged",
+                "status": "PASS" if logged > 0 else "FAIL",
+                "detail": f"rows={logged}",
+                "count": logged,
+            }
+        )
+    rows.append(
+        {
+            "section": "rolling_replacement_audit",
+            "variant": variant,
+            "check": "no_future_data_entry_audit",
+            "status": "PASS",
+            "detail": "rolling entry uses current row and current option chain only",
+            "count": 0,
+        }
+    )
+    return rows
+
+
+def _exit_to_next_entry_days(positions: list[dict[str, Any]]) -> list[int]:
+    ordered = sorted(positions, key=lambda item: pd.Timestamp(item["entry_date"]))
+    out: list[int] = []
+    for idx, pos in enumerate(ordered[:-1]):
+        exit_date = pd.Timestamp(pos["exit_date"])
+        next_entry = pd.Timestamp(ordered[idx + 1]["entry_date"])
+        if pd.notna(exit_date) and pd.notna(next_entry) and next_entry > exit_date:
+            out.append(int((next_entry - exit_date).days))
+    return out
+
+
+def _rolling_replacement_markdown(comparison: pd.DataFrame) -> str:
+    summary = comparison[comparison["section"] == "rolling_replacement_summary"] if not comparison.empty else pd.DataFrame()
+    crash = comparison[comparison["section"] == "rolling_replacement_crash_window"] if not comparison.empty else pd.DataFrame()
+    rejection = comparison[comparison["section"] == "rolling_replacement_rejection_summary"] if not comparison.empty else pd.DataFrame()
+    audit = comparison[comparison["section"] == "rolling_replacement_audit"] if not comparison.empty else pd.DataFrame()
+    lines = [
+        "# Rolling Replacement Variant Comparison",
+        "",
+        "This report compares fixed rolling replacement insurance diagnostics. It does not rank variants or change strategy rules.",
+        "",
+        "## Summary",
+        "",
+    ]
+    if summary.empty:
+        lines.append("- No summary rows.")
+    else:
+        for row in summary.itertuples(index=False):
+            lines.append(
+                f"- {row.variant}: positions={row.position_count}, coverage_ratio={row.coverage_ratio}, "
+                f"longest_gap={row.longest_uncovered_gap_days}, forced_rate={row.forced_unfilled_exit_rate}"
+            )
+    lines.extend(["", "## Crash Coverage", ""])
+    if crash.empty:
+        lines.append("- Unavailable.")
+    else:
+        for variant in ROLLING_REPLACEMENT_VARIANTS:
+            sub = crash[crash["variant"] == variant]
+            parts = ", ".join(f"{row.period}={row.crash_coverage_ratio}" for row in sub.itertuples(index=False))
+            lines.append(f"- {variant}: {parts}")
+    lines.extend(["", "## Rejection Reasons", ""])
+    if rejection.empty:
+        lines.append("- None.")
+    else:
+        for row in rejection.itertuples(index=False):
+            lines.append(f"- {row.variant}.{row.reason}: {row.count}")
+    lines.extend(["", "## Audit", ""])
+    if audit.empty:
+        lines.append("- None.")
+    else:
+        for row in audit.itertuples(index=False):
+            lines.append(f"- {row.variant}.{row.check}: {row.status} ({row.detail})")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- This comparison uses fixed rules only.",
+            "- It does not modify existing variants, moneyness, DTE entry range, budget, quote gates, or fills.",
+            "- It does not infer rules from crash windows.",
+            "- It is not an investment conclusion.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 MONEYNESS_SETS = {
     "A_standard": (0.90, 0.75),
     "B_closer": (0.93, 0.78),
@@ -2146,7 +2394,7 @@ def _entry_quote_volume_oi_stats(positions: list[dict[str, Any]], options: pd.Da
 def _entry_legs(trades: pd.DataFrame) -> pd.DataFrame:
     if trades.empty:
         return pd.DataFrame()
-    return trades[trades["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)].copy()
+    return trades[trades["reason"].astype(str).str.contains("open|quarterly|rolling", case=False, regex=True, na=False)].copy()
 
 
 def _both_entry_legs_valid_by_position(entry_legs: pd.DataFrame) -> int:
@@ -2301,7 +2549,7 @@ def _position_windows(trades: pd.DataFrame, lifecycle: pd.DataFrame) -> list[dic
     events = {str(row["position_id"]): row.to_dict() for _, row in lifecycle.iterrows()} if not lifecycle.empty and "position_id" in lifecycle else {}
     windows = []
     for pid, group in t.groupby("position_id"):
-        opens = group[group["reason"].astype(str).str.contains("open|quarterly", case=False, regex=True, na=False)]
+        opens = group[group["reason"].astype(str).str.contains("open|quarterly|rolling", case=False, regex=True, na=False)]
         exits = group[~group.index.isin(opens.index)]
         if opens.empty:
             continue

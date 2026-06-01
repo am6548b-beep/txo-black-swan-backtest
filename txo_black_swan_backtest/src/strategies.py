@@ -48,11 +48,15 @@ class ContractSelector:
     def __init__(self, options: pd.DataFrame, config: dict):
         self.options = options.copy()
         self.config = config
+        self._chains_by_date = {
+            pd.Timestamp(date): group.copy()
+            for date, group in self.options.groupby("date", sort=False)
+        } if not self.options.empty and "date" in self.options else {}
 
     def chain(self, date: pd.Timestamp) -> pd.DataFrame:
         if self.options.empty:
             return self.options
-        return self.options[self.options["date"] == date]
+        return self._chains_by_date.get(pd.Timestamp(date), self.options.iloc[0:0])
 
     def by_key(self, date: pd.Timestamp, expiry: str, cp: str, strike: float) -> OptionContract | None:
         chain = self.chain(date)

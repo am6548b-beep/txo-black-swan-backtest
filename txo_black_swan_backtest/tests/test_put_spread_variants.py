@@ -14,6 +14,8 @@ from src.put_spread_variants import (
     _rolling_coverage_markdown,
     _run_exit_timing_variants,
     _run_moneyness_tradability_diagnostic,
+    _run_rolling_replacement_comparison,
+    _rolling_replacement_markdown,
     run_put_spread_variants,
 )
 
@@ -560,3 +562,151 @@ def test_rolling_coverage_report_does_not_rank_or_recommend() -> None:
 
     assert "best" not in text
     assert "recommend" not in text
+
+
+def test_rolling_base_insurance_attempts_entry_when_no_active_position() -> None:
+    dates = ["2024-01-02"]
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        _options("2024-01-02"),
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    _, trades = engine.run()
+
+    assert len(trades) == 2
+    assert set(trades["reason"]) == {"rolling_base_put_spread"}
+
+
+def test_rolling_base_insurance_does_not_wait_for_quarterly_schedule() -> None:
+    dates = ["2024-01-02", "2024-01-03"]
+    options = _options("2024-01-03")
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    _, trades = engine.run()
+
+    assert not trades.empty
+    assert set(trades["date"]) == {"2024-01-03"}
+
+
+def test_rolling_base_insurance_respects_annual_budget() -> None:
+    dates = ["2024-01-02", "2024-04-01", "2024-07-01", "2024-10-01"]
+    options = pd.concat([_options(date) for date in dates], ignore_index=True)
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    equity, trades = engine.run()
+    annual_rows = _run_rolling_replacement_comparison(_market(dates), options, _portfolio(dates), _config(), _put_params(), _ic_params())
+    audit = annual_rows[(annual_rows["section"] == "rolling_replacement_audit") & (annual_rows["check"] == "annual_budget_breach_count")]
+
+    assert not equity.empty
+    assert not trades.empty
+    assert (audit["status"] == "PASS").all()
+
+
+def test_rolling_base_insurance_uses_only_valid_quotes() -> None:
+    dates = ["2024-01-02"]
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        _options("2024-01-02", valid=False),
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    _, trades = engine.run()
+
+    assert trades.empty
+
+
+def test_rolling_base_insurance_does_not_trade_expired_options() -> None:
+    dates = ["2024-01-02"]
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        _options("2024-01-02", expired=True),
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    _, trades = engine.run()
+
+    assert trades.empty
+
+
+def test_rolling_base_insurance_logs_rejection_reasons() -> None:
+    dates = ["2024-01-02"]
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        _options("2024-01-02", valid=False),
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    engine.run()
+
+    assert engine.rolling_rejection_events
+    assert engine.rolling_rejection_events[0]["reason"] in {"QUOTE_NOT_VALID", "LOW_LIQUIDITY", "NO_CONTRACT_FOUND", "UNKNOWN"}
+
+
+def test_rolling_replacement_report_does_not_rank_or_recommend() -> None:
+    comparison = pd.DataFrame(
+        [
+            {
+                "section": "rolling_replacement_summary",
+                "variant": "rolling_base_insurance",
+                "position_count": 1,
+                "coverage_ratio": 0.1,
+                "longest_uncovered_gap_days": 10,
+                "forced_unfilled_exit_rate": 0.0,
+            }
+        ]
+    )
+    text = _rolling_replacement_markdown(comparison).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
+
+
+def test_rolling_entry_uses_current_day_only_without_future_retry() -> None:
+    dates = ["2024-01-02"]
+    future_options = _options("2024-01-03")
+    engine = PutSpreadVariantStateMachine(
+        _market(dates),
+        future_options,
+        _portfolio(dates),
+        _config(),
+        _put_params(),
+        _ic_params(),
+        mode="put_spread_only",
+        variant_name="rolling_base_insurance",
+    )
+    _, trades = engine.run()
+
+    assert trades.empty
