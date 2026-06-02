@@ -31,6 +31,12 @@ from .utils import year_key
 DEFAULT_HEDGE_GAP_THRESHOLD = 0.03
 DEFAULT_MAX_CONTRACTS_PER_DAY = 10
 DEFAULT_MAX_TOTAL_HEDGE_COVERAGE = 0.80
+BUDGET_POLICIES = [
+    "current_policy",
+    "score_gated_budget_release",
+    "reserve_high_risk_budget",
+    "base_then_risk_budget",
+]
 
 
 def calculate_hedge_gap(target_hedge_coverage: float, current_hedge_coverage: float) -> float:
@@ -39,11 +45,50 @@ def calculate_hedge_gap(target_hedge_coverage: float, current_hedge_coverage: fl
     return float(target_hedge_coverage) - float(current_hedge_coverage)
 
 
+def budget_release_fraction(policy: str, hedge_need_score: float) -> float:
+    """Return annual budget fraction released by a fixed diagnostics policy."""
+
+    score = float(np.clip(hedge_need_score, 0.0, 100.0)) if pd.notna(hedge_need_score) else 0.0
+    if policy == "current_policy":
+        return 1.0
+    if policy == "score_gated_budget_release":
+        if score < 25.0:
+            return 0.10
+        if score < 50.0:
+            return 0.40
+        if score < 75.0:
+            return 0.75
+        return 1.0
+    if policy == "reserve_high_risk_budget":
+        return 0.60 if score < 50.0 else 1.0
+    if policy == "base_then_risk_budget":
+        if score < 25.0:
+            return 0.10
+        if score < 50.0:
+            return 0.50
+        return 1.0
+    raise ValueError(f"Unknown budget policy: {policy}")
+
+
+def _put_spread_entry_cost_per_contract(long_price: float, short_price: float, config: dict) -> float:
+    """Return expected cash cost for opening one long/short put spread."""
+
+    point_value = float(config["txo_point_value"])
+    commission = float(config["commission_per_contract_per_side"])
+    tax_rate = float(config["option_tax_rate_on_premium"])
+    long_gross = float(long_price) * point_value
+    short_gross = float(short_price) * point_value
+    return (long_gross - short_gross) + (2.0 * commission) + ((long_gross + short_gross) * tax_rate)
+
+
 class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
     """Put-spread simulation driven only by target hedge coverage gap."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, budget_policy: str = "current_policy", **kwargs):
         super().__init__(*args, **kwargs)
+        if budget_policy not in BUDGET_POLICIES:
+            raise ValueError(f"Unknown budget policy: {budget_policy}")
+        self.budget_policy = budget_policy
         self.position_counter = itertools.count(1)
         self.coverage_rows: list[dict[str, Any]] = []
         self.rejection_events: list[dict[str, Any]] = []
@@ -105,7 +150,7 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
         hedge_gap = calculate_hedge_gap(target_coverage, current_coverage)
         threshold = float(self.config.get("risk_scaled_hedge_gap_threshold", DEFAULT_HEDGE_GAP_THRESHOLD))
         budget_cap, budget_used, budget_remaining = self._annual_budget(row, stock_equity)
-        record = self._base_coverage_record(row, stock_equity, beta_exposure, target_coverage, current_coverage, hedge_gap, budget_used, budget_remaining)
+        record = self._base_coverage_record(row, stock_equity, beta_exposure, target_coverage, current_coverage, hedge_gap, budget_cap, budget_used, budget_remaining)
         record["attempted_entry_today"] = False
         record["entry_success"] = False
         record["rejection_reason"] = ""
@@ -140,8 +185,7 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
         stress = is_stress_day(row, self.config)
         long_px = fill_price(long_put, "BUY", self.config, stress)
         short_px = fill_price(short_put, "SELL", self.config, stress)
-        per_spread_debit = (long_px - short_px) * float(self.config["txo_point_value"])
-        per_spread_cost = per_spread_debit + 2 * float(self.config["commission_per_contract_per_side"])
+        per_spread_cost = _put_spread_entry_cost_per_contract(long_px, short_px, self.config)
         if per_spread_cost <= 0:
             record["rejection_reason"] = "UNKNOWN"
             self._log_rejection(record)
@@ -160,13 +204,14 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
         if opened:
             spend = -(self.trades[-2].cash_flow + self.trades[-1].cash_flow)
             self.annual_hedge_spend[year_key(row.date)] = budget_used + max(0.0, spend)
+            _, updated_used, updated_remaining = self._annual_budget(row, stock_equity)
             after_coverage = current_put_spread_coverage(
                 self._open_positions("put_spread"),
                 beta_exposure,
                 float(self.config["txo_point_value"]),
             )
-            record["annual_budget_used"] = self.annual_hedge_spend[year_key(row.date)]
-            record["annual_budget_remaining"] = max(0.0, budget_cap - self.annual_hedge_spend[year_key(row.date)])
+            record["annual_budget_used"] = updated_used
+            record["annual_budget_remaining"] = updated_remaining
             record["current_hedge_coverage_after_entry"] = after_coverage
             record["hedge_gap_after_entry"] = calculate_hedge_gap(target_coverage, after_coverage)
             record["contracts_added"] = qty
@@ -181,7 +226,8 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
         restriction = macro_restrictions(macro_state)
         cap = float(self.config["max_annual_hedge_budget_pct"]) * float(restriction["hedge_budget_multiplier"]) * stock_equity
         used = self.annual_hedge_spend.get(year_key(row.date), 0.0)
-        return cap, used, max(0.0, cap - used)
+        release_cap = cap * budget_release_fraction(self.budget_policy, float(getattr(row, "HedgeNeedScore", 0.0)))
+        return cap, used, max(0.0, min(cap, release_cap) - used)
 
     def _base_coverage_record(
         self,
@@ -191,6 +237,7 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
         target_coverage: float,
         current_coverage: float,
         hedge_gap: float,
+        budget_cap: float,
         budget_used: float,
         budget_remaining: float,
     ) -> dict[str, Any]:
@@ -205,8 +252,10 @@ class RiskScaledHedgeStateMachine(BlackSwanStateMachine):
             "stock_equity": stock_equity,
             "portfolio_beta_exposure": beta_exposure,
             "active_put_spread_count": len(self._open_positions("put_spread")),
+            "annual_budget_limit": budget_cap,
             "annual_budget_used": budget_used,
             "annual_budget_remaining": budget_remaining,
+            "budget_policy": self.budget_policy,
             "score_confidence": str(getattr(row, "score_confidence", "")),
             "volatility_source_type": str(getattr(row, "volatility_source_type", "")),
             "contracts_added": 0,
@@ -376,15 +425,26 @@ def run_risk_scaled_hedge_simulation(data_dir: Path, report_dir: Path, config: d
     out = pd.DataFrame(summary)
     breakdown = risk_scaled_hedge_breakdown(coverage, trades, lifecycle, equity, config)
     budget_audit = hedge_budget_allocation_audit(coverage, trades, equity, config)
+    dynamic_budget = dynamic_budget_policy_diagnostic(
+        market,
+        options,
+        portfolio,
+        config,
+        put_params,
+        ic_params,
+        current_run={"policy": "current_policy", "equity": equity, "trades": trades, "coverage": coverage, "lifecycle": lifecycle},
+    )
 
     out.to_csv(report_dir / "risk_scaled_hedge_simulation.csv", index=False)
     trades.to_csv(report_dir / "risk_scaled_hedge_trades.csv", index=False)
     coverage.to_csv(report_dir / "risk_scaled_hedge_coverage.csv", index=False)
     breakdown.to_csv(report_dir / "risk_scaled_hedge_breakdown.csv", index=False)
     budget_audit.to_csv(report_dir / "hedge_budget_allocation_audit.csv", index=False)
+    dynamic_budget.to_csv(report_dir / "dynamic_budget_policy_diagnostic.csv", index=False)
     (report_dir / "risk_scaled_hedge_simulation.md").write_text(_markdown(out, coverage, trades), encoding="utf-8")
     (report_dir / "risk_scaled_hedge_breakdown.md").write_text(_breakdown_markdown(breakdown), encoding="utf-8")
     (report_dir / "hedge_budget_allocation_audit.md").write_text(_budget_audit_markdown(budget_audit), encoding="utf-8")
+    (report_dir / "dynamic_budget_policy_diagnostic.md").write_text(_dynamic_budget_policy_markdown(dynamic_budget), encoding="utf-8")
     return out, trades, coverage
 
 
@@ -412,6 +472,58 @@ def hedge_budget_allocation_audit(coverage: pd.DataFrame, trades: pd.DataFrame, 
     out.extend(_budget_crash_pre_window_rows(cov))
     out.extend(_budget_crash_classification_rows(cov))
     return pd.DataFrame(out)
+
+
+def dynamic_budget_policy_diagnostic(
+    market: pd.DataFrame,
+    options: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    config: dict,
+    put_params: dict,
+    ic_params: dict,
+    current_run: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Compare fixed annual-budget release policies without changing total budget."""
+
+    rows: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
+    if current_run is not None:
+        runs.append(current_run)
+    for policy in BUDGET_POLICIES:
+        if current_run is not None and policy == current_run.get("policy"):
+            continue
+        engine = RiskScaledHedgeStateMachine(market, options, portfolio, config, put_params, ic_params, mode="put_spread_only", budget_policy=policy)
+        equity, trades = engine.run()
+        runs.append(
+            {
+                "policy": policy,
+                "equity": equity,
+                "trades": trades,
+                "coverage": pd.DataFrame(engine.coverage_rows),
+                "lifecycle": pd.DataFrame(equity.attrs.get("position_lifecycle_events", [])),
+            }
+        )
+    for run in runs:
+        policy = str(run["policy"])
+        cov = run["coverage"].copy()
+        trades = run["trades"].copy()
+        equity = run["equity"].copy()
+        lifecycle = run["lifecycle"].copy()
+        if not cov.empty:
+            cov["date"] = pd.to_datetime(cov["date"], errors="coerce")
+            cov["year"] = cov["date"].dt.year
+        if not trades.empty:
+            trades["date"] = pd.to_datetime(trades["date"], errors="coerce")
+            trades["expiry"] = pd.to_datetime(trades["expiry"], errors="coerce") if "expiry" in trades else pd.NaT
+            trades["year"] = trades["date"].dt.year
+        if not equity.empty:
+            equity["date"] = pd.to_datetime(equity["date"], errors="coerce")
+            equity["year"] = equity["date"].dt.year
+        rows.extend(_dynamic_policy_summary_rows(policy, cov, trades, equity, lifecycle, config))
+        rows.extend(_dynamic_policy_score_bucket_rows(policy, cov, trades))
+        rows.extend(_dynamic_policy_crash_rows(policy, cov))
+        rows.extend(_dynamic_policy_audit_rows(policy, cov, trades, lifecycle))
+    return pd.DataFrame(rows)
 
 
 def risk_scaled_hedge_breakdown(
@@ -458,6 +570,145 @@ def _candidate_block_reason(pool: pd.DataFrame) -> str:
     if (volume.fillna(0) < 50).any() or (oi.fillna(0) < 100).any():
         return "LOW_LIQUIDITY"
     return "UNKNOWN"
+
+
+def _dynamic_policy_summary_rows(policy: str, cov: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, lifecycle: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
+    annual_cost = _annual_cost_total(trades)
+    forced = int((lifecycle.get("issue", pd.Series(dtype=str)).astype(str) == "forced_unfilled_exit").sum()) if not lifecycle.empty else 0
+    budget_block = int(cov["rejection_reason"].astype(str).eq("BUDGET_EXCEEDED").sum()) if not cov.empty else 0
+    quote_block = int(cov["rejection_reason"].astype(str).eq("QUOTE_NOT_VALID").sum()) if not cov.empty else 0
+    return [
+        {
+            "section": "policy_summary",
+            "policy": policy,
+            "annual_hedge_cost": annual_cost,
+            "average_hedge_gap": _mean(cov, "hedge_gap_after_entry"),
+            "average_current_coverage": _mean(cov, "current_hedge_coverage_after_entry"),
+            "days_execution_blocked_by_budget": budget_block,
+            "days_execution_blocked_by_quote": quote_block,
+            "forced_unfilled_exit_count": forced,
+        }
+    ]
+
+
+def _dynamic_policy_score_bucket_rows(policy: str, cov: pd.DataFrame, trades: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    daily_cost = _daily_new_hedge_cost(trades)
+    if cov.empty:
+        return rows
+    data = cov.copy()
+    data["date_norm"] = data["date"].dt.normalize()
+    data["score_bucket"] = data["HedgeNeedScore"].map(_score_bucket)
+    data["new_hedge_cost_today"] = data["date_norm"].map(daily_cost).fillna(0.0)
+    entries = _position_entry_buckets(trades, data)
+    entry_counts = _entry_count_by_bucket(trades, entries)
+    for bucket in ["0-25", "25-50", "50-75", "75-100"]:
+        group = data[data["score_bucket"].eq(bucket)]
+        rows.append(
+            {
+                "section": "policy_score_bucket",
+                "policy": policy,
+                "score_bucket": bucket,
+                "hedge_cost_spent": float(group["new_hedge_cost_today"].sum()),
+                "number_of_entries": int(entry_counts.get(bucket, 0)),
+                "average_hedge_gap": float(pd.to_numeric(group["hedge_gap_after_entry"], errors="coerce").mean()) if not group.empty else np.nan,
+            }
+        )
+    return rows
+
+
+def _dynamic_policy_crash_rows(policy: str, cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    for label, (start_text, end_text) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        end = pd.Timestamp(end_text)
+        crash = cov[(cov["date"] >= start) & (cov["date"] <= end)]
+        pre = cov[(cov["date"] >= start - pd.Timedelta(days=180)) & (cov["date"] < start)]
+        row: dict[str, Any] = {
+            "section": "policy_crash_window",
+            "policy": policy,
+            "crash_window": label,
+            "crash_coverage_ratio": float((pd.to_numeric(crash["current_hedge_coverage_after_entry"], errors="coerce").fillna(0) > 0).mean()) if not crash.empty else np.nan,
+        }
+        for offset in [180, 90, 60, 30]:
+            sample_date = start - pd.Timedelta(days=offset)
+            prior = cov[cov["date"] <= sample_date].sort_values("date").tail(1)
+            if prior.empty:
+                row[f"budget_remaining_{offset}d_before_crash"] = ""
+                row[f"budget_used_pct_{offset}d_before_crash"] = ""
+                continue
+            sample = prior.iloc[0]
+            used = float(sample.get("annual_budget_used", 0.0))
+            limit = float(sample.get("annual_budget_limit", used + float(sample.get("annual_budget_remaining", 0.0))))
+            row[f"budget_remaining_{offset}d_before_crash"] = float(sample.get("annual_budget_remaining", 0.0))
+            row[f"budget_used_pct_{offset}d_before_crash"] = _safe_ratio(used, limit)
+        rows.append(row)
+    return rows
+
+
+def _dynamic_policy_audit_rows(policy: str, cov: pd.DataFrame, trades: pd.DataFrame, lifecycle: pd.DataFrame) -> list[dict[str, Any]]:
+    non_valid = int((trades.get("quote_quality_status", pd.Series(dtype=str)).fillna("MISSING").astype(str) != "VALID").sum()) if not trades.empty else 0
+    after_expiry = int((trades["date"] > trades["expiry"]).sum()) if not trades.empty and "expiry" in trades else 0
+    budget_breach = _annual_budget_breach_count(cov)
+    target_changed = _target_mapping_changed(cov)
+    checks = [
+        ("non_VALID_quote_trades_count", non_valid),
+        ("trade_date_after_expiry_count", after_expiry),
+        ("annual_budget_breach_count", budget_breach),
+        ("target_coverage_mapping_changed_count", target_changed),
+    ]
+    return [
+        {"section": "policy_audit", "policy": policy, "check": check, "status": "PASS" if count == 0 else "FAIL", "count": int(count)}
+        for check, count in checks
+    ]
+
+
+def _annual_cost_total(trades: pd.DataFrame) -> float:
+    if trades.empty:
+        return 0.0
+    opens = trades[trades["reason"].astype(str).eq("risk_scaled_hedge_open")]
+    return float(-opens["cash_flow"].sum()) if not opens.empty else 0.0
+
+
+def _annual_budget_breach_count(cov: pd.DataFrame) -> int:
+    if cov.empty:
+        return 0
+    breaches = 0
+    for _, group in cov.groupby("year"):
+        used = pd.to_numeric(group["annual_budget_used"], errors="coerce").fillna(0.0).max()
+        limit = pd.to_numeric(group["annual_budget_limit"], errors="coerce").fillna(0.0).max() if "annual_budget_limit" in group else used
+        if used > limit + 1e-8:
+            breaches += 1
+    return int(breaches)
+
+
+def _target_mapping_changed(cov: pd.DataFrame) -> int:
+    if cov.empty:
+        return 0
+    # Policy variants must not mutate the existing score-to-target columns during a run.
+    recomputed = cov["HedgeNeedScore"].map(_target_from_score_for_audit)
+    changed = ~np.isclose(pd.to_numeric(cov["target_hedge_coverage"], errors="coerce"), recomputed, rtol=1e-10, atol=1e-10)
+    return int(changed.sum())
+
+
+def _target_from_score_for_audit(score: float) -> float:
+    value = float(np.clip(score, 0.0, 100.0)) if pd.notna(score) else 0.0
+    if value <= 25.0:
+        return _linear(value, 0.0, 25.0, 0.0, 0.10)
+    if value <= 50.0:
+        return _linear(value, 25.0, 50.0, 0.10, 0.25)
+    if value <= 75.0:
+        return _linear(value, 50.0, 75.0, 0.25, 0.50)
+    return _linear(value, 75.0, 100.0, 0.50, 0.80)
+
+
+def _linear(value: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    if x1 == x0:
+        return y1
+    return y0 + (value - x0) * (y1 - y0) / (x1 - x0)
+
 
 
 def _daily_new_hedge_cost(trades: pd.DataFrame) -> pd.Series:
@@ -1228,6 +1479,60 @@ def _budget_audit_markdown(audit: pd.DataFrame) -> str:
     lowered = text.lower()
     if "best" in lowered or "recommend" in lowered or "should increase" in lowered:
         raise ValueError("hedge budget allocation audit contains disallowed wording")
+    return text
+
+
+def _dynamic_budget_policy_markdown(diagnostic: pd.DataFrame) -> str:
+    lines = [
+        "# Dynamic Budget Policy Diagnostic",
+        "",
+        "Diagnostics-only comparison of fixed annual-budget release policies.",
+        "",
+        "Total annual budget, target coverage mapping, HedgeNeedScore, quote quality gate, and execution logic are unchanged.",
+        "",
+        "## Policy Summary",
+    ]
+    if not diagnostic.empty:
+        summary = diagnostic[diagnostic["section"].eq("policy_summary")]
+        for _, row in summary.iterrows():
+            lines.append(
+                f"- {row.get('policy')}: cost={row.get('annual_hedge_cost')}, "
+                f"avg_gap={row.get('average_hedge_gap')}, "
+                f"avg_current={row.get('average_current_coverage')}, "
+                f"budget_block_days={row.get('days_execution_blocked_by_budget')}"
+            )
+        lines.extend(["", "## Score Buckets"])
+        buckets = diagnostic[diagnostic["section"].eq("policy_score_bucket")]
+        for _, row in buckets.iterrows():
+            lines.append(
+                f"- {row.get('policy')} {row.get('score_bucket')}: "
+                f"cost={row.get('hedge_cost_spent')}, entries={row.get('number_of_entries')}"
+            )
+        lines.extend(["", "## Crash Windows"])
+        crashes = diagnostic[diagnostic["section"].eq("policy_crash_window")]
+        for _, row in crashes.iterrows():
+            lines.append(
+                f"- {row.get('policy')} {row.get('crash_window')}: "
+                f"coverage={row.get('crash_coverage_ratio')}, "
+                f"remaining_30d={row.get('budget_remaining_30d_before_crash')}"
+            )
+        lines.extend(["", "## Audit"])
+        audits = diagnostic[diagnostic["section"].eq("policy_audit")]
+        for _, row in audits.iterrows():
+            lines.append(f"- {row.get('policy')} {row.get('check')}: {row.get('status')} count={row.get('count')}")
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- This report compares budget release behavior only.",
+            "- It does not change annual budget or target coverage.",
+            "- It does not create new strategy rules.",
+        ]
+    )
+    text = "\n".join(lines) + "\n"
+    lowered = text.lower()
+    if "best" in lowered or "recommend" in lowered:
+        raise ValueError("dynamic budget policy report contains disallowed wording")
     return text
 
 

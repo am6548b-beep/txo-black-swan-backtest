@@ -9,8 +9,11 @@ from src.risk_scaled_hedge import (
     RiskScaledHedgeStateMachine,
     _breakdown_markdown,
     _budget_audit_markdown,
+    _dynamic_budget_policy_markdown,
     _markdown,
+    budget_release_fraction,
     calculate_hedge_gap,
+    dynamic_budget_policy_diagnostic,
     hedge_budget_allocation_audit,
     risk_scaled_hedge_breakdown,
     run_risk_scaled_hedge_simulation,
@@ -375,3 +378,98 @@ def test_budget_diagnostics_do_not_modify_simulation_output() -> None:
 
     pd.testing.assert_frame_equal(trades, trades_before)
     pd.testing.assert_frame_equal(coverage, coverage_before)
+
+
+def test_score_gated_budget_release_respects_bucket_caps() -> None:
+    assert budget_release_fraction("score_gated_budget_release", 10.0) == pytest.approx(0.10)
+    assert budget_release_fraction("score_gated_budget_release", 30.0) == pytest.approx(0.40)
+    assert budget_release_fraction("score_gated_budget_release", 60.0) == pytest.approx(0.75)
+    assert budget_release_fraction("score_gated_budget_release", 80.0) == pytest.approx(1.00)
+
+
+def test_reserve_high_risk_budget_preserves_reserve_before_score_50() -> None:
+    assert budget_release_fraction("reserve_high_risk_budget", 49.0) == pytest.approx(0.60)
+    assert budget_release_fraction("reserve_high_risk_budget", 50.0) == pytest.approx(1.00)
+
+
+def test_base_then_risk_budget_respects_score_gates() -> None:
+    assert budget_release_fraction("base_then_risk_budget", 20.0) == pytest.approx(0.10)
+    assert budget_release_fraction("base_then_risk_budget", 40.0) == pytest.approx(0.50)
+    assert budget_release_fraction("base_then_risk_budget", 55.0) == pytest.approx(1.00)
+
+
+def test_total_annual_budget_unchanged_across_policies() -> None:
+    date = "2024-01-02"
+    limits: list[float] = []
+    for policy in ["current_policy", "score_gated_budget_release", "reserve_high_risk_budget", "base_then_risk_budget"]:
+        engine = RiskScaledHedgeStateMachine(
+            _market([date], target=0.30, score=30.0),
+            _options(date),
+            _portfolio([date]),
+            _config(),
+            _put_params(),
+            _ic_params(),
+            mode="put_spread_only",
+            budget_policy=policy,
+        )
+        engine.run()
+        limits.append(float(pd.DataFrame(engine.coverage_rows).iloc[0]["annual_budget_limit"]))
+
+    assert set(limits) == {36_000.0}
+
+
+def test_policies_do_not_alter_target_coverage_mapping() -> None:
+    date = "2024-01-02"
+    diagnostic = dynamic_budget_policy_diagnostic(
+        _market([date], target=0.35, score=60.0),
+        _options(date),
+        _portfolio([date]),
+        _config(),
+        _put_params(),
+        _ic_params(),
+    )
+    audit = diagnostic[
+        diagnostic["section"].eq("policy_audit")
+        & diagnostic["check"].eq("target_coverage_mapping_changed_count")
+    ]
+
+    assert not audit.empty
+    assert set(audit["status"]) == {"PASS"}
+
+
+def test_dynamic_budget_policies_do_not_produce_non_valid_quote_trades() -> None:
+    date = "2024-01-02"
+    diagnostic = dynamic_budget_policy_diagnostic(
+        _market([date], target=0.30, score=60.0),
+        _options(date),
+        _portfolio([date]),
+        _config(),
+        _put_params(),
+        _ic_params(),
+    )
+    audit = diagnostic[
+        diagnostic["section"].eq("policy_audit")
+        & diagnostic["check"].eq("non_VALID_quote_trades_count")
+    ]
+
+    assert not audit.empty
+    assert set(audit["status"]) == {"PASS"}
+
+
+def test_dynamic_budget_policy_report_has_no_disallowed_wording() -> None:
+    diagnostic = pd.DataFrame(
+        [
+            {
+                "section": "policy_summary",
+                "policy": "current_policy",
+                "annual_hedge_cost": 100.0,
+                "average_hedge_gap": 0.1,
+                "average_current_coverage": 0.05,
+                "days_execution_blocked_by_budget": 0,
+            }
+        ]
+    )
+    text = _dynamic_budget_policy_markdown(diagnostic).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
