@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import BASE_CONFIG, COARSE_PARAM_GRID, IRON_CONDOR_PARAMS, PUT_SPREAD_PARAMS, REGIME_WINDOWS, WALK_FORWARD_WINDOWS
+from src.ai_bullwhip_risk import write_ai_bullwhip_diagnostics
 from src.backtester import run_backtest
 from src.data_pipeline import build_processed_data
 from src.data_validation import validate_data
@@ -45,6 +46,7 @@ def parse_args() -> argparse.Namespace:
             "put_spread_variants",
             "hedge_need_diagnostics",
             "risk_scaled_hedge_simulation",
+            "ai_bullwhip_diagnostics",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
@@ -135,6 +137,15 @@ def main() -> None:
         print(f"Risk-scaled hedge trades written to {root / 'reports' / 'risk_scaled_hedge_trades.csv'}")
         print(f"Risk-scaled hedge coverage written to {root / 'reports' / 'risk_scaled_hedge_coverage.csv'}")
         print(f"Rows: summary={len(summary)}, trades={len(trades)}, coverage={len(coverage)}")
+        return
+
+    if args.mode == "ai_bullwhip_diagnostics":
+        audit = write_ai_bullwhip_diagnostics(processed_data_dir, root / "reports")
+        counts = audit["status"].value_counts().to_dict() if not audit.empty and "status" in audit else {}
+        print(f"AI bullwhip risk audit written to {root / 'reports' / 'ai_bullwhip_risk_audit.csv'}")
+        print(f"AI bullwhip risk audit markdown written to {root / 'reports' / 'ai_bullwhip_risk_audit.md'}")
+        print(f"Rows: {len(audit)}")
+        print(f"Status counts: {counts}")
         return
 
     if args.mode == "stress":

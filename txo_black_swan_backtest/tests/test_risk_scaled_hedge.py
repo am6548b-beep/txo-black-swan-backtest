@@ -7,8 +7,10 @@ import pytest
 
 from src.risk_scaled_hedge import (
     RiskScaledHedgeStateMachine,
+    _breakdown_markdown,
     _markdown,
     calculate_hedge_gap,
+    risk_scaled_hedge_breakdown,
     run_risk_scaled_hedge_simulation,
 )
 
@@ -225,3 +227,74 @@ def test_report_has_no_disallowed_wording() -> None:
 
     assert "best" not in text
     assert "recommended" not in text
+
+
+def test_breakdown_does_not_add_trades_or_modify_outputs() -> None:
+    equity, trades, coverage = _run_engine(["2024-01-02", "2024-01-03"], target=0.30)
+    trades_before = trades.copy(deep=True)
+    coverage_before = coverage.copy(deep=True)
+
+    risk_scaled_hedge_breakdown(coverage, trades, pd.DataFrame(), equity, _config())
+
+    pd.testing.assert_frame_equal(trades, trades_before)
+    pd.testing.assert_frame_equal(coverage, coverage_before)
+
+
+def test_annual_cost_pct_calculation_is_cost_over_portfolio_equity() -> None:
+    equity = pd.DataFrame({"date": pd.to_datetime(["2024-01-02"]), "total_equity": [1_500_000.0]})
+    trades = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02"]),
+            "position_id": ["RSH-1"],
+            "reason": ["risk_scaled_hedge_open"],
+            "cash_flow": [-15_000.0],
+        }
+    )
+    coverage = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02"]),
+            "stock_equity": [1_200_000.0],
+            "annual_budget_used": [15_000.0],
+            "annual_budget_remaining": [30_000.0],
+            "rejection_reason": [""],
+            "target_hedge_coverage": [0.2],
+            "current_hedge_coverage_after_entry": [0.1],
+            "hedge_gap_after_entry": [0.1],
+            "attempted_entry_today": [True],
+            "entry_success": [True],
+            "HedgeNeedScore": [50.0],
+        }
+    )
+
+    breakdown = risk_scaled_hedge_breakdown(coverage, trades, pd.DataFrame(), equity, _config())
+    annual = breakdown[breakdown["section"].eq("annual_cost_breakdown")].iloc[0]
+
+    assert annual["annual_hedge_cost_pct_portfolio_equity"] == pytest.approx(0.01)
+
+
+def test_crash_breakdown_does_not_generate_trades() -> None:
+    equity, trades, coverage = _run_engine(["2020-01-02"], target=0.30)
+    before_count = len(trades)
+
+    breakdown = risk_scaled_hedge_breakdown(coverage, trades, pd.DataFrame(), equity, _config())
+
+    assert len(trades) == before_count
+    assert "crash_window_breakdown" in set(breakdown["section"])
+
+
+def test_breakdown_report_has_no_disallowed_wording() -> None:
+    breakdown = pd.DataFrame(
+        [
+            {
+                "section": "annual_cost_breakdown",
+                "year": 2024,
+                "annual_hedge_cost": 100.0,
+                "annual_budget_used_pct": 0.1,
+                "budget_constrained_days": 0,
+            }
+        ]
+    )
+    text = _breakdown_markdown(breakdown).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text

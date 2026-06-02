@@ -374,12 +374,47 @@ def run_risk_scaled_hedge_simulation(data_dir: Path, report_dir: Path, config: d
     summary.extend(_annual_budget_rows(trades, equity, config))
     summary.extend(_audit_rows(trades, coverage, config))
     out = pd.DataFrame(summary)
+    breakdown = risk_scaled_hedge_breakdown(coverage, trades, lifecycle, equity, config)
 
     out.to_csv(report_dir / "risk_scaled_hedge_simulation.csv", index=False)
     trades.to_csv(report_dir / "risk_scaled_hedge_trades.csv", index=False)
     coverage.to_csv(report_dir / "risk_scaled_hedge_coverage.csv", index=False)
+    breakdown.to_csv(report_dir / "risk_scaled_hedge_breakdown.csv", index=False)
     (report_dir / "risk_scaled_hedge_simulation.md").write_text(_markdown(out, coverage, trades), encoding="utf-8")
+    (report_dir / "risk_scaled_hedge_breakdown.md").write_text(_breakdown_markdown(breakdown), encoding="utf-8")
     return out, trades, coverage
+
+
+def risk_scaled_hedge_breakdown(
+    coverage: pd.DataFrame,
+    trades: pd.DataFrame,
+    lifecycle: pd.DataFrame,
+    equity: pd.DataFrame,
+    config: dict,
+) -> pd.DataFrame:
+    """Build diagnostics-only breakdown of risk-scaled simulation behavior."""
+
+    rows: list[dict[str, Any]] = []
+    cov = coverage.copy()
+    if not cov.empty:
+        cov["date"] = pd.to_datetime(cov["date"], errors="coerce")
+        cov["year"] = cov["date"].dt.year
+    tr = trades.copy()
+    if not tr.empty:
+        tr["date"] = pd.to_datetime(tr["date"], errors="coerce")
+        if "expiry" in tr:
+            tr["expiry"] = pd.to_datetime(tr["expiry"], errors="coerce")
+        tr["year"] = tr["date"].dt.year
+    eq = equity.copy()
+    if not eq.empty:
+        eq["date"] = pd.to_datetime(eq["date"], errors="coerce")
+        eq["year"] = eq["date"].dt.year
+    rows.extend(_breakdown_annual_cost(cov, tr, eq, config))
+    rows.extend(_breakdown_coverage_gap(cov))
+    rows.extend(_breakdown_crash_windows(cov, tr))
+    rows.extend(_breakdown_forced_exits(cov, tr, lifecycle))
+    rows.extend(_breakdown_rejections(cov))
+    return pd.DataFrame(rows)
 
 
 def _candidate_block_reason(pool: pd.DataFrame) -> str:
@@ -394,6 +429,254 @@ def _candidate_block_reason(pool: pd.DataFrame) -> str:
     if (volume.fillna(0) < 50).any() or (oi.fillna(0) < 100).any():
         return "LOW_LIQUIDITY"
     return "UNKNOWN"
+
+
+def _breakdown_annual_cost(cov: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    opens = trades[trades.get("reason", pd.Series(dtype=str)).astype(str).eq("risk_scaled_hedge_open")].copy() if not trades.empty else pd.DataFrame()
+    annual_cost = -opens.groupby("year")["cash_flow"].sum() if not opens.empty else pd.Series(dtype=float)
+    first_equity = equity.groupby("year")["total_equity"].first() if not equity.empty and "total_equity" in equity else pd.Series(dtype=float)
+    for year, group in cov.groupby("year"):
+        if pd.isna(year):
+            continue
+        year_int = int(year)
+        cost = float(annual_cost.get(year_int, 0.0))
+        base_equity = float(first_equity.get(year_int, group["stock_equity"].iloc[0] if "stock_equity" in group else np.nan))
+        limit = float(pd.to_numeric(group["annual_budget_used"], errors="coerce").fillna(0).max() + pd.to_numeric(group["annual_budget_remaining"], errors="coerce").fillna(0).iloc[-1])
+        remaining = float(pd.to_numeric(group["annual_budget_remaining"], errors="coerce").fillna(0).iloc[-1])
+        budget_constrained_days = int(group["rejection_reason"].astype(str).eq("BUDGET_EXCEEDED").sum())
+        coverage_days = int((pd.to_numeric(group["current_hedge_coverage_after_entry"], errors="coerce").fillna(0) > 0).sum())
+        high_cost_low_protection = bool(cost > 0 and coverage_days < max(5, int(len(group) * 0.10)))
+        rows.append(
+            {
+                "section": "annual_cost_breakdown",
+                "year": year_int,
+                "annual_hedge_cost": cost,
+                "annual_hedge_cost_pct_portfolio_equity": _safe_ratio(cost, base_equity),
+                "annual_budget_limit": limit,
+                "annual_budget_used_pct": _safe_ratio(cost, limit),
+                "annual_budget_remaining": remaining,
+                "budget_constrained_days": budget_constrained_days,
+                "budget_constrained_coverage": budget_constrained_days > 0,
+                "high_cost_but_low_crash_protection": high_cost_low_protection,
+            }
+        )
+    return rows
+
+
+def _breakdown_coverage_gap(cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    for year, group in cov.groupby("year"):
+        if pd.isna(year):
+            continue
+        failed = group[group["attempted_entry_today"].astype(bool) & ~group["entry_success"].astype(bool)]
+        top_reason = ""
+        if not failed.empty:
+            counts = failed["rejection_reason"].astype(str).value_counts()
+            top_reason = str(counts.index[0]) if not counts.empty else ""
+        rows.append(
+            {
+                "section": "coverage_gap_breakdown",
+                "year": int(year),
+                "average_target_coverage": float(pd.to_numeric(group["target_hedge_coverage"], errors="coerce").mean()),
+                "average_current_coverage": float(pd.to_numeric(group["current_hedge_coverage_after_entry"], errors="coerce").mean()),
+                "average_hedge_gap": float(pd.to_numeric(group["hedge_gap_after_entry"], errors="coerce").mean()),
+                "max_hedge_gap": float(pd.to_numeric(group["hedge_gap_after_entry"], errors="coerce").max()),
+                "days_target_gt_current": int((pd.to_numeric(group["target_hedge_coverage"], errors="coerce") > pd.to_numeric(group["current_hedge_coverage_after_entry"], errors="coerce")).sum()),
+                "days_execution_attempted": int(group["attempted_entry_today"].astype(bool).sum()),
+                "days_execution_failed": int(len(failed)),
+                "top_rejection_reason": top_reason,
+            }
+        )
+    return rows
+
+
+def _breakdown_crash_windows(cov: pd.DataFrame, trades: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    for label, (start_text, end_text) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        end = pd.Timestamp(end_text)
+        pre = cov[(cov["date"] >= start - pd.Timedelta(days=180)) & (cov["date"] < start)].copy()
+        crash = cov[(cov["date"] >= start) & (cov["date"] <= end)].copy()
+        if pre.empty:
+            rows.append({"section": "crash_window_breakdown", "crash_window": label, "status": "WARN", "detail": "NO_PRE_WINDOW_ROWS"})
+            continue
+        failed = pre[pre["attempted_entry_today"].astype(bool) & ~pre["entry_success"].astype(bool)]
+        top_reasons = _top_reasons(failed)
+        score_rose_failed = bool(((pre["HedgeNeedScore"].diff().fillna(0) > 0) & (pre["current_hedge_coverage_after_entry"].diff().fillna(0) <= 0)).any())
+        exited_before = _positions_exited_before_crash(trades, start)
+        rows.append(
+            {
+                "section": "crash_window_breakdown",
+                "crash_window": label,
+                "pre_crash_average_HedgeNeedScore": float(pd.to_numeric(pre["HedgeNeedScore"], errors="coerce").mean()),
+                "pre_crash_target_coverage": float(pd.to_numeric(pre["target_hedge_coverage"], errors="coerce").mean()),
+                "pre_crash_current_coverage": float(pd.to_numeric(pre["current_hedge_coverage_after_entry"], errors="coerce").mean()),
+                "hedge_gap_before_crash": float(pd.to_numeric(pre["hedge_gap_after_entry"], errors="coerce").iloc[-1]),
+                "crash_coverage_ratio": float((pd.to_numeric(crash["current_hedge_coverage_after_entry"], errors="coerce").fillna(0) > 0).mean()) if not crash.empty else np.nan,
+                "budget_remaining_before_crash": float(pd.to_numeric(pre["annual_budget_remaining"], errors="coerce").iloc[-1]),
+                "top_rejection_reasons_before_crash": top_reasons,
+                "score_rose_but_execution_failed": score_rose_failed,
+                "execution_succeeded_but_position_exited_before_crash": exited_before,
+            }
+        )
+    return rows
+
+
+def _breakdown_forced_exits(cov: pd.DataFrame, trades: pd.DataFrame, lifecycle: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if lifecycle.empty or trades.empty:
+        return rows
+    forced = lifecycle[lifecycle.get("issue", pd.Series(dtype=str)).astype(str).eq("forced_unfilled_exit")].copy()
+    if forced.empty:
+        return rows
+    forced["exit_date"] = pd.to_datetime(forced["exit_date"], errors="coerce")
+    forced["year"] = forced["exit_date"].dt.year
+    entry = _entry_position_metadata(trades)
+    forced = forced.merge(entry, on="position_id", how="left")
+    if not cov.empty:
+        score_by_date = cov[["date", "HedgeNeedScore"]].copy()
+        forced = forced.merge(score_by_date, left_on="exit_date", right_on="date", how="left", suffixes=("", "_coverage"))
+    for year, group in forced.groupby("year"):
+        rows.append({"section": "forced_exit_breakdown", "dimension": "year", "bucket": int(year) if pd.notna(year) else "", "forced_unfilled_exit_count": int(len(group))})
+    for bucket, group in forced.groupby(forced["long_put_moneyness"].map(_moneyness_bucket)):
+        rows.append({"section": "forced_exit_breakdown", "dimension": "moneyness", "bucket": bucket, "forced_unfilled_exit_count": int(len(group))})
+    for bucket, group in forced.groupby(forced["entry_dte"].map(_entry_dte_bucket)):
+        rows.append({"section": "forced_exit_breakdown", "dimension": "entry_dte", "bucket": bucket, "forced_unfilled_exit_count": int(len(group))})
+    for reason, group in forced.groupby(forced.get("issue", pd.Series(dtype=str)).astype(str)):
+        rows.append({"section": "forced_exit_breakdown", "dimension": "exit_reason", "bucket": reason, "forced_unfilled_exit_count": int(len(group))})
+    high_score_count = int((pd.to_numeric(forced.get("HedgeNeedScore", pd.Series(dtype=float)), errors="coerce") >= 50.0).sum())
+    rows.append(
+        {
+            "section": "forced_exit_breakdown",
+            "dimension": "high_score_period",
+            "bucket": "HedgeNeedScore>=50",
+            "forced_unfilled_exit_count": high_score_count,
+            "total_forced_unfilled_exit_count": int(len(forced)),
+        }
+    )
+    return rows
+
+
+def _breakdown_rejections(cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    target_reasons = {"QUOTE_NOT_VALID", "BUDGET_EXCEEDED", "NO_CONTRACT_FOUND", "LOW_LIQUIDITY"}
+    rejected = cov[cov["rejection_reason"].astype(str).isin(target_reasons)].copy()
+    for reason, group in rejected.groupby("rejection_reason"):
+        affected_years = ",".join(str(int(year)) for year in sorted(group["year"].dropna().unique()))
+        affected_crash_windows = _affected_crash_windows(group)
+        rows.append(
+            {
+                "section": "rejection_reason_deep_dive",
+                "rejection_reason": reason,
+                "affected_years": affected_years,
+                "affected_crash_windows": affected_crash_windows,
+                "rejected_days": int(len(group)),
+                "average_HedgeNeedScore_on_rejected_days": float(pd.to_numeric(group["HedgeNeedScore"], errors="coerce").mean()),
+                "average_hedge_gap_on_rejected_days": float(pd.to_numeric(group["hedge_gap"], errors="coerce").mean()),
+                "days_target_coverage_gt_0": int((pd.to_numeric(group["target_hedge_coverage"], errors="coerce") > 0).sum()),
+            }
+        )
+    return rows
+
+
+def _entry_position_metadata(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=["position_id"])
+    opens = trades[trades["reason"].astype(str).eq("risk_scaled_hedge_open")].copy()
+    rows: list[dict[str, Any]] = []
+    for pos_id, group in opens.groupby("position_id"):
+        buys = group[(group["action"] == "BUY") & (group["cp"] == "P")]
+        sells = group[(group["action"] == "SELL") & (group["cp"] == "P")]
+        if buys.empty or sells.empty:
+            continue
+        buy = buys.iloc[0]
+        sell = sells.iloc[0]
+        underlying = float(buy.get("txf_close_at_trade", np.nan))
+        rows.append(
+            {
+                "position_id": pos_id,
+                "entry_date": buy["date"],
+                "entry_dte": float(buy.get("dte_at_trade", np.nan)),
+                "long_put_moneyness": _safe_ratio(float(buy["strike"]), underlying),
+                "short_put_moneyness": _safe_ratio(float(sell["strike"]), underlying),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _positions_exited_before_crash(trades: pd.DataFrame, crash_start: pd.Timestamp) -> bool:
+    if trades.empty:
+        return False
+    opens = trades[trades["reason"].astype(str).eq("risk_scaled_hedge_open")].copy()
+    exits = trades[~trades["reason"].astype(str).eq("risk_scaled_hedge_open")].copy()
+    if opens.empty or exits.empty:
+        return False
+    entry_dates = opens.groupby("position_id")["date"].min()
+    exit_dates = exits.groupby("position_id")["date"].max()
+    for pos_id, entry_date in entry_dates.items():
+        exit_date = exit_dates.get(pos_id)
+        if pd.notna(entry_date) and pd.notna(exit_date) and entry_date < crash_start and exit_date < crash_start:
+            return True
+    return False
+
+
+def _top_reasons(df: pd.DataFrame) -> str:
+    if df.empty or "rejection_reason" not in df:
+        return ""
+    counts = df["rejection_reason"].astype(str).replace("", np.nan).dropna().value_counts().head(3)
+    return ";".join(f"{reason}:{int(count)}" for reason, count in counts.items())
+
+
+def _affected_crash_windows(group: pd.DataFrame) -> str:
+    labels: list[str] = []
+    for label, (start_text, end_text) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        end = pd.Timestamp(end_text)
+        pre_start = start - pd.Timedelta(days=180)
+        if ((group["date"] >= pre_start) & (group["date"] <= end)).any():
+            labels.append(label)
+    return ",".join(labels)
+
+
+def _moneyness_bucket(value: Any) -> str:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if pd.isna(val):
+        return "UNKNOWN"
+    if val < 0.88:
+        return "<0.88"
+    if val < 0.91:
+        return "0.88-0.91"
+    if val < 0.94:
+        return "0.91-0.94"
+    return ">=0.94"
+
+
+def _entry_dte_bucket(value: Any) -> str:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if pd.isna(val):
+        return "UNKNOWN"
+    if val <= 60:
+        return "<=60"
+    if val <= 90:
+        return "61-90"
+    if val <= 120:
+        return "91-120"
+    return ">120"
 
 
 def _summary_rows(coverage: pd.DataFrame, trades: pd.DataFrame, lifecycle: pd.DataFrame, equity: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
@@ -542,6 +825,70 @@ def _markdown(summary: pd.DataFrame, coverage: pd.DataFrame, trades: pd.DataFram
     lowered = text.lower()
     if "best" in lowered or "recommended" in lowered:
         raise ValueError("risk-scaled hedge report contains disallowed wording")
+    return text
+
+
+def _breakdown_markdown(breakdown: pd.DataFrame) -> str:
+    lines = [
+        "# Risk-Scaled Hedge Breakdown",
+        "",
+        "Diagnostics-only breakdown of cost, coverage gaps, crash windows, forced exits, and rejection reasons.",
+        "",
+        "This report does not change strategy rules, HedgeNeedScore weights, target mapping, or execution logic.",
+        "",
+        "## Annual Cost",
+    ]
+    if not breakdown.empty:
+        annual = breakdown[breakdown["section"].eq("annual_cost_breakdown")]
+        for _, row in annual.iterrows():
+            lines.append(
+                f"- {int(row['year'])}: cost={row.get('annual_hedge_cost')}, "
+                f"budget_used_pct={row.get('annual_budget_used_pct')}, "
+                f"budget_constrained_days={row.get('budget_constrained_days')}"
+            )
+        lines.extend(["", "## Coverage Gap"])
+        gaps = breakdown[breakdown["section"].eq("coverage_gap_breakdown")]
+        for _, row in gaps.iterrows():
+            lines.append(
+                f"- {int(row['year'])}: avg_target={row.get('average_target_coverage')}, "
+                f"avg_current={row.get('average_current_coverage')}, "
+                f"top_rejection={row.get('top_rejection_reason')}"
+            )
+        lines.extend(["", "## Crash Windows"])
+        crashes = breakdown[breakdown["section"].eq("crash_window_breakdown")]
+        for _, row in crashes.iterrows():
+            lines.append(
+                f"- {row.get('crash_window')}: crash_coverage_ratio={row.get('crash_coverage_ratio')}, "
+                f"top_rejections={row.get('top_rejection_reasons_before_crash')}, "
+                f"score_rose_failed={row.get('score_rose_but_execution_failed')}"
+            )
+        lines.extend(["", "## Forced Exits"])
+        forced = breakdown[breakdown["section"].eq("forced_exit_breakdown")]
+        for _, row in forced.head(20).iterrows():
+            lines.append(
+                f"- {row.get('dimension')} {row.get('bucket')}: forced_count={row.get('forced_unfilled_exit_count')}"
+            )
+        lines.extend(["", "## Rejections"])
+        rejects = breakdown[breakdown["section"].eq("rejection_reason_deep_dive")]
+        for _, row in rejects.iterrows():
+            lines.append(
+                f"- {row.get('rejection_reason')}: days={row.get('rejected_days')}, "
+                f"avg_score={row.get('average_HedgeNeedScore_on_rejected_days')}, "
+                f"avg_gap={row.get('average_hedge_gap_on_rejected_days')}"
+            )
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- Breakdown rows are diagnostics only.",
+            "- No new trades are generated by this report.",
+            "- Dirty data and quote/liquidity failures remain visible as failures or rejection reasons.",
+        ]
+    )
+    text = "\n".join(lines) + "\n"
+    lowered = text.lower()
+    if "best" in lowered or "recommend" in lowered:
+        raise ValueError("risk-scaled hedge breakdown contains disallowed wording")
     return text
 
 
