@@ -8,8 +8,10 @@ import pytest
 from src.risk_scaled_hedge import (
     RiskScaledHedgeStateMachine,
     _breakdown_markdown,
+    _budget_audit_markdown,
     _markdown,
     calculate_hedge_gap,
+    hedge_budget_allocation_audit,
     risk_scaled_hedge_breakdown,
     run_risk_scaled_hedge_simulation,
 )
@@ -298,3 +300,78 @@ def test_breakdown_report_has_no_disallowed_wording() -> None:
 
     assert "best" not in text
     assert "recommend" not in text
+
+
+def test_budget_spent_by_score_bucket_sums_to_annual_hedge_cost() -> None:
+    equity, trades, coverage = _run_engine(["2024-01-02", "2024-01-03"], target=0.30)
+    audit = hedge_budget_allocation_audit(coverage, trades, equity, _config())
+    bucket_cost = audit.loc[audit["section"].eq("budget_usage_by_score_bucket"), "hedge_cost_spent"].sum()
+    opens = trades[trades["reason"].eq("risk_scaled_hedge_open")]
+    annual_cost = -opens["cash_flow"].sum()
+
+    assert bucket_cost == pytest.approx(annual_cost)
+
+
+def test_budget_exhaustion_timing_is_first_threshold_crossing() -> None:
+    coverage = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+            "HedgeNeedScore": [10.0, 30.0, 60.0],
+            "target_hedge_coverage": [0.05, 0.15, 0.30],
+            "current_hedge_coverage_after_entry": [0.0, 0.1, 0.2],
+            "hedge_gap_after_entry": [0.05, 0.05, 0.10],
+            "annual_budget_used": [10.0, 50.0, 100.0],
+            "annual_budget_remaining": [90.0, 50.0, 0.0],
+            "active_put_spread_count": [0, 1, 1],
+            "rejection_reason": ["", "", "BUDGET_EXCEEDED"],
+            "attempted_entry_today": [True, True, True],
+            "entry_success": [True, True, False],
+        }
+    )
+    audit = hedge_budget_allocation_audit(coverage, pd.DataFrame(), pd.DataFrame(), _config())
+    timing = audit[audit["section"].eq("budget_exhaustion_timing")].iloc[0]
+
+    assert timing["date_budget_25pct_used"] == "2024-01-03"
+    assert timing["date_budget_50pct_used"] == "2024-01-03"
+    assert timing["date_budget_75pct_used"] == "2024-01-04"
+    assert timing["date_budget_100pct_used"] == "2024-01-04"
+
+
+def test_crash_pre_window_budget_state_does_not_generate_trades() -> None:
+    equity, trades, coverage = _run_engine(["2020-01-02"], target=0.30)
+    before_count = len(trades)
+
+    audit = hedge_budget_allocation_audit(coverage, trades, equity, _config())
+
+    assert len(trades) == before_count
+    assert "crash_pre_window_budget_state" in set(audit["section"])
+
+
+def test_budget_allocation_report_has_no_disallowed_wording() -> None:
+    audit = pd.DataFrame(
+        [
+            {
+                "section": "budget_usage_by_score_bucket",
+                "score_bucket": "25-50",
+                "hedge_cost_spent": 100.0,
+                "number_of_entries": 1,
+                "average_hedge_gap": 0.1,
+            }
+        ]
+    )
+    text = _budget_audit_markdown(audit).lower()
+
+    assert "best" not in text
+    assert "recommend" not in text
+    assert "should increase" not in text
+
+
+def test_budget_diagnostics_do_not_modify_simulation_output() -> None:
+    equity, trades, coverage = _run_engine(["2024-01-02", "2024-01-03"], target=0.30)
+    trades_before = trades.copy(deep=True)
+    coverage_before = coverage.copy(deep=True)
+
+    hedge_budget_allocation_audit(coverage, trades, equity, _config())
+
+    pd.testing.assert_frame_equal(trades, trades_before)
+    pd.testing.assert_frame_equal(coverage, coverage_before)

@@ -375,14 +375,43 @@ def run_risk_scaled_hedge_simulation(data_dir: Path, report_dir: Path, config: d
     summary.extend(_audit_rows(trades, coverage, config))
     out = pd.DataFrame(summary)
     breakdown = risk_scaled_hedge_breakdown(coverage, trades, lifecycle, equity, config)
+    budget_audit = hedge_budget_allocation_audit(coverage, trades, equity, config)
 
     out.to_csv(report_dir / "risk_scaled_hedge_simulation.csv", index=False)
     trades.to_csv(report_dir / "risk_scaled_hedge_trades.csv", index=False)
     coverage.to_csv(report_dir / "risk_scaled_hedge_coverage.csv", index=False)
     breakdown.to_csv(report_dir / "risk_scaled_hedge_breakdown.csv", index=False)
+    budget_audit.to_csv(report_dir / "hedge_budget_allocation_audit.csv", index=False)
     (report_dir / "risk_scaled_hedge_simulation.md").write_text(_markdown(out, coverage, trades), encoding="utf-8")
     (report_dir / "risk_scaled_hedge_breakdown.md").write_text(_breakdown_markdown(breakdown), encoding="utf-8")
+    (report_dir / "hedge_budget_allocation_audit.md").write_text(_budget_audit_markdown(budget_audit), encoding="utf-8")
     return out, trades, coverage
+
+
+def hedge_budget_allocation_audit(coverage: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Build diagnostics-only audit of annual hedge budget allocation."""
+
+    cov = coverage.copy()
+    if cov.empty:
+        return pd.DataFrame([{"section": "error", "status": "FAIL", "detail": "coverage unavailable"}])
+    cov["date"] = pd.to_datetime(cov["date"], errors="coerce")
+    cov["year"] = cov["date"].dt.year
+    tr = trades.copy()
+    if not tr.empty:
+        tr["date"] = pd.to_datetime(tr["date"], errors="coerce")
+        tr["expiry"] = pd.to_datetime(tr["expiry"], errors="coerce") if "expiry" in tr else pd.NaT
+        tr["year"] = tr["date"].dt.year
+    eq = equity.copy()
+    if not eq.empty:
+        eq["date"] = pd.to_datetime(eq["date"], errors="coerce")
+        eq["year"] = eq["date"].dt.year
+    daily_cost = _daily_new_hedge_cost(tr)
+    out = _budget_timeline_rows(cov, daily_cost)
+    out.extend(_budget_score_bucket_rows(cov, tr, daily_cost))
+    out.extend(_budget_exhaustion_rows(cov))
+    out.extend(_budget_crash_pre_window_rows(cov))
+    out.extend(_budget_crash_classification_rows(cov))
+    return pd.DataFrame(out)
 
 
 def risk_scaled_hedge_breakdown(
@@ -429,6 +458,265 @@ def _candidate_block_reason(pool: pd.DataFrame) -> str:
     if (volume.fillna(0) < 50).any() or (oi.fillna(0) < 100).any():
         return "LOW_LIQUIDITY"
     return "UNKNOWN"
+
+
+def _daily_new_hedge_cost(trades: pd.DataFrame) -> pd.Series:
+    if trades.empty or "reason" not in trades:
+        return pd.Series(dtype=float)
+    opens = trades[trades["reason"].astype(str).eq("risk_scaled_hedge_open")].copy()
+    if opens.empty:
+        return pd.Series(dtype=float)
+    return -opens.groupby(opens["date"].dt.normalize())["cash_flow"].sum()
+
+
+def _budget_timeline_rows(cov: pd.DataFrame, daily_cost: pd.Series) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in cov.itertuples(index=False):
+        date = pd.Timestamp(row.date).normalize()
+        used = float(getattr(row, "annual_budget_used", 0.0))
+        remaining = float(getattr(row, "annual_budget_remaining", 0.0))
+        limit = used + remaining
+        rows.append(
+            {
+                "section": "annual_budget_usage_timeline",
+                "date": str(date.date()),
+                "year": int(getattr(row, "year")) if pd.notna(getattr(row, "year")) else "",
+                "HedgeNeedScore": float(getattr(row, "HedgeNeedScore", np.nan)),
+                "target_hedge_coverage": float(getattr(row, "target_hedge_coverage", np.nan)),
+                "current_hedge_coverage": float(getattr(row, "current_hedge_coverage_after_entry", np.nan)),
+                "hedge_gap": float(getattr(row, "hedge_gap_after_entry", np.nan)),
+                "annual_budget_used": used,
+                "annual_budget_remaining": remaining,
+                "budget_used_pct": _safe_ratio(used, limit),
+                "new_hedge_cost_today": float(daily_cost.get(date, 0.0)),
+                "active_put_spread_count": int(getattr(row, "active_put_spread_count", 0)),
+                "rejection_reason": str(getattr(row, "rejection_reason", "")),
+            }
+        )
+    return rows
+
+
+def _budget_score_bucket_rows(cov: pd.DataFrame, trades: pd.DataFrame, daily_cost: pd.Series) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if cov.empty:
+        return rows
+    entry_days = cov[["date", "HedgeNeedScore", "hedge_gap_after_entry", "annual_budget_used", "annual_budget_remaining"]].copy()
+    entry_days["date_norm"] = entry_days["date"].dt.normalize()
+    entry_days["new_hedge_cost_today"] = entry_days["date_norm"].map(daily_cost).fillna(0.0)
+    entry_days["score_bucket"] = entry_days["HedgeNeedScore"].map(_score_bucket)
+    total_budget_limit = _total_budget_limit(cov)
+    position_bucket = _position_entry_buckets(trades, entry_days)
+    crash_contribution = _crash_coverage_contribution_by_bucket(position_bucket)
+    entry_counts = _entry_count_by_bucket(trades, position_bucket)
+    for bucket in ["0-25", "25-50", "50-75", "75-100"]:
+        group = entry_days[entry_days["score_bucket"].eq(bucket)]
+        spent = float(group["new_hedge_cost_today"].sum())
+        rows.append(
+            {
+                "section": "budget_usage_by_score_bucket",
+                "score_bucket": bucket,
+                "hedge_cost_spent": spent,
+                "pct_of_total_annual_budget_limit": _safe_ratio(spent, total_budget_limit),
+                "number_of_entries": int(entry_counts.get(bucket, 0)),
+                "average_hedge_gap": float(pd.to_numeric(group["hedge_gap_after_entry"], errors="coerce").mean()) if not group.empty else np.nan,
+                "realized_crash_coverage_contribution_if_available": int(crash_contribution.get(bucket, 0)),
+            }
+        )
+    return rows
+
+
+def _budget_exhaustion_rows(cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for year, group in cov.groupby("year"):
+        if pd.isna(year):
+            continue
+        group = group.sort_values("date").copy()
+        used = pd.to_numeric(group["annual_budget_used"], errors="coerce").fillna(0.0)
+        remaining = pd.to_numeric(group["annual_budget_remaining"], errors="coerce").fillna(0.0)
+        group["budget_used_pct"] = np.where((used + remaining) > 0, used / (used + remaining), np.nan)
+        row: dict[str, Any] = {"section": "budget_exhaustion_timing", "year": int(year)}
+        for threshold in [0.25, 0.50, 0.75, 1.00]:
+            hit = group[group["budget_used_pct"] >= threshold]
+            label = f"{int(threshold * 100)}pct"
+            if hit.empty:
+                row[f"date_budget_{label}_used"] = ""
+                row[f"HedgeNeedScore_at_{label}"] = ""
+                row[f"target_coverage_at_{label}"] = ""
+                continue
+            first = hit.iloc[0]
+            row[f"date_budget_{label}_used"] = str(pd.Timestamp(first["date"]).date())
+            row[f"HedgeNeedScore_at_{label}"] = float(first["HedgeNeedScore"])
+            row[f"target_coverage_at_{label}"] = float(first["target_hedge_coverage"])
+        row["crash_happened_after_budget_exhaustion"] = _crash_after_budget_exhaustion(int(year), row.get("date_budget_100pct_used", ""))
+        rows.append(row)
+    return rows
+
+
+def _budget_crash_pre_window_rows(cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label, (start_text, _) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        for offset in [180, 90, 60, 30]:
+            sample_date = start - pd.Timedelta(days=offset)
+            prior = cov[cov["date"] <= sample_date].sort_values("date").tail(1)
+            if prior.empty:
+                rows.append({"section": "crash_pre_window_budget_state", "crash_window": label, "days_before_crash": offset, "status": "WARN", "detail": "NO_PRIOR_ROW"})
+                continue
+            row = prior.iloc[0]
+            used = float(row["annual_budget_used"])
+            remaining = float(row["annual_budget_remaining"])
+            reason = str(row.get("rejection_reason", ""))
+            rows.append(
+                {
+                    "section": "crash_pre_window_budget_state",
+                    "crash_window": label,
+                    "days_before_crash": offset,
+                    "sample_date": str(pd.Timestamp(row["date"]).date()),
+                    "budget_remaining": remaining,
+                    "budget_used_pct": _safe_ratio(used, used + remaining),
+                    "hedge_gap": float(row["hedge_gap_after_entry"]),
+                    "budget_blocked_execution": reason == "BUDGET_EXCEEDED",
+                    "quote_quality_blocked_execution": reason == "QUOTE_NOT_VALID",
+                    "rejection_reason": reason,
+                }
+            )
+    return rows
+
+
+def _budget_crash_classification_rows(cov: pd.DataFrame) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label, (start_text, _) in CRASH_WINDOWS.items():
+        start = pd.Timestamp(start_text)
+        pre = cov[(cov["date"] >= start - pd.Timedelta(days=180)) & (cov["date"] < start)].copy()
+        if pre.empty:
+            rows.append({"section": "budget_diagnostic_classification", "crash_window": label, "classification": "MIXED", "detail": "NO_PRE_WINDOW_ROWS"})
+            continue
+        classification = _classify_budget_issue(pre)
+        counts = pre["rejection_reason"].astype(str).replace("", np.nan).dropna().value_counts().to_dict()
+        rows.append(
+            {
+                "section": "budget_diagnostic_classification",
+                "crash_window": label,
+                "classification": classification,
+                "budget_exceeded_days": int(counts.get("BUDGET_EXCEEDED", 0)),
+                "quote_not_valid_days": int(counts.get("QUOTE_NOT_VALID", 0)),
+                "no_contract_found_days": int(counts.get("NO_CONTRACT_FOUND", 0)),
+                "hedge_gap_too_small_days": int(counts.get("HEDGE_GAP_TOO_SMALL", 0)),
+                "average_HedgeNeedScore": float(pd.to_numeric(pre["HedgeNeedScore"], errors="coerce").mean()),
+                "average_hedge_gap": float(pd.to_numeric(pre["hedge_gap_after_entry"], errors="coerce").mean()),
+                "budget_remaining_before_crash": float(pd.to_numeric(pre["annual_budget_remaining"], errors="coerce").iloc[-1]),
+            }
+        )
+    return rows
+
+
+def _score_bucket(score: Any) -> str:
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return "MISSING"
+    if pd.isna(value):
+        return "MISSING"
+    if value < 25.0:
+        return "0-25"
+    if value < 50.0:
+        return "25-50"
+    if value < 75.0:
+        return "50-75"
+    return "75-100"
+
+
+def _total_budget_limit(cov: pd.DataFrame) -> float:
+    total = 0.0
+    for _, group in cov.groupby("year"):
+        used = pd.to_numeric(group["annual_budget_used"], errors="coerce").fillna(0.0)
+        remaining = pd.to_numeric(group["annual_budget_remaining"], errors="coerce").fillna(0.0)
+        total += float((used + remaining).max())
+    return total
+
+
+def _position_entry_buckets(trades: pd.DataFrame, entry_days: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=["position_id", "entry_date", "exit_date", "score_bucket"])
+    opens = trades[trades["reason"].astype(str).eq("risk_scaled_hedge_open")].copy()
+    if opens.empty:
+        return pd.DataFrame(columns=["position_id", "entry_date", "exit_date", "score_bucket"])
+    entries = opens.groupby("position_id")["date"].min().rename("entry_date").reset_index()
+    exits = trades[~trades["reason"].astype(str).eq("risk_scaled_hedge_open")].groupby("position_id")["date"].max().rename("exit_date").reset_index()
+    expiries = opens.groupby("position_id")["expiry"].max().rename("expiry").reset_index() if "expiry" in opens else pd.DataFrame(columns=["position_id", "expiry"])
+    positions = entries.merge(exits, on="position_id", how="left").merge(expiries, on="position_id", how="left")
+    positions["exit_date"] = positions["exit_date"].fillna(positions["expiry"])
+    score_lookup = entry_days[["date_norm", "score_bucket"]].drop_duplicates("date_norm")
+    positions["date_norm"] = positions["entry_date"].dt.normalize()
+    return positions.merge(score_lookup, on="date_norm", how="left")
+
+
+def _entry_count_by_bucket(trades: pd.DataFrame, position_bucket: pd.DataFrame) -> dict[str, int]:
+    if trades.empty or position_bucket.empty:
+        return {}
+    return position_bucket["score_bucket"].fillna("MISSING").value_counts().astype(int).to_dict()
+
+
+def _crash_coverage_contribution_by_bucket(position_bucket: pd.DataFrame) -> dict[str, int]:
+    out: dict[str, set[pd.Timestamp]] = {}
+    if position_bucket.empty:
+        return {}
+    for _, pos in position_bucket.iterrows():
+        bucket = str(pos.get("score_bucket", "MISSING"))
+        entry = pd.Timestamp(pos["entry_date"])
+        exit_date = pd.Timestamp(pos["exit_date"])
+        if pd.isna(entry) or pd.isna(exit_date):
+            continue
+        for start_text, end_text in CRASH_WINDOWS.values():
+            start = pd.Timestamp(start_text)
+            end = pd.Timestamp(end_text)
+            overlap_start = max(entry, start)
+            overlap_end = min(exit_date, end)
+            if overlap_start <= overlap_end:
+                out.setdefault(bucket, set()).update(pd.date_range(overlap_start, overlap_end, freq="D"))
+    return {bucket: len(days) for bucket, days in out.items()}
+
+
+def _crash_after_budget_exhaustion(year: int, exhaustion_date: Any) -> bool:
+    if not exhaustion_date:
+        return False
+    try:
+        exhausted = pd.Timestamp(exhaustion_date)
+    except (TypeError, ValueError):
+        return False
+    for start_text, _ in CRASH_WINDOWS.values():
+        start = pd.Timestamp(start_text)
+        if start.year == year and start > exhausted:
+            return True
+    return False
+
+
+def _classify_budget_issue(pre: pd.DataFrame) -> str:
+    reasons = pre["rejection_reason"].astype(str).replace("", np.nan).dropna().value_counts()
+    budget_days = int(reasons.get("BUDGET_EXCEEDED", 0))
+    quote_days = int(reasons.get("QUOTE_NOT_VALID", 0))
+    no_contract_days = int(reasons.get("NO_CONTRACT_FOUND", 0))
+    gap_small_days = int(reasons.get("HEDGE_GAP_TOO_SMALL", 0))
+    avg_score = float(pd.to_numeric(pre["HedgeNeedScore"], errors="coerce").mean())
+    avg_gap = float(pd.to_numeric(pre["hedge_gap_after_entry"], errors="coerce").mean())
+    used = pd.to_numeric(pre["annual_budget_used"], errors="coerce").fillna(0.0)
+    remaining = pd.to_numeric(pre["annual_budget_remaining"], errors="coerce").fillna(0.0)
+    used_pct_end = _safe_ratio(float(used.iloc[-1]), float(used.iloc[-1] + remaining.iloc[-1]))
+    used_pct = float(used_pct_end) if used_pct_end != "" else 0.0
+    if avg_score < 20.0:
+        return "SCORE_TOO_LOW"
+    if avg_gap <= DEFAULT_HEDGE_GAP_THRESHOLD:
+        return "HEDGE_GAP_TOO_SMALL"
+    if budget_days > 0 and used_pct >= 0.95 and budget_days >= max(quote_days, no_contract_days):
+        return "BUDGET_SPENT_TOO_EARLY"
+    if quote_days > 0 and quote_days >= max(budget_days, no_contract_days):
+        return "BUDGET_AVAILABLE_BUT_QUOTES_FAILED"
+    if no_contract_days > 0 and no_contract_days >= max(budget_days, quote_days):
+        return "BUDGET_AVAILABLE_BUT_NO_CONTRACT"
+    if gap_small_days > 0 and gap_small_days >= max(budget_days, quote_days, no_contract_days):
+        return "HEDGE_GAP_TOO_SMALL"
+    return "MIXED"
+
 
 
 def _breakdown_annual_cost(cov: pd.DataFrame, trades: pd.DataFrame, equity: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
@@ -889,6 +1177,57 @@ def _breakdown_markdown(breakdown: pd.DataFrame) -> str:
     lowered = text.lower()
     if "best" in lowered or "recommend" in lowered:
         raise ValueError("risk-scaled hedge breakdown contains disallowed wording")
+    return text
+
+
+def _budget_audit_markdown(audit: pd.DataFrame) -> str:
+    lines = [
+        "# Hedge Budget Allocation Audit",
+        "",
+        "Diagnostics-only audit of annual hedge budget timing, score-bucket usage, and crash pre-window budget state.",
+        "",
+        "This report does not change annual budget, target coverage mapping, HedgeNeedScore, or execution logic.",
+        "",
+        "## Budget Usage By Score Bucket",
+    ]
+    if not audit.empty:
+        buckets = audit[audit["section"].eq("budget_usage_by_score_bucket")]
+        for _, row in buckets.iterrows():
+            lines.append(
+                f"- {row.get('score_bucket')}: cost={row.get('hedge_cost_spent')}, "
+                f"entries={row.get('number_of_entries')}, avg_gap={row.get('average_hedge_gap')}"
+            )
+        lines.extend(["", "## Budget Exhaustion Timing"])
+        exhaustion = audit[audit["section"].eq("budget_exhaustion_timing")]
+        for _, row in exhaustion.iterrows():
+            lines.append(
+                f"- {row.get('year')}: 25pct={row.get('date_budget_25pct_used')}, "
+                f"50pct={row.get('date_budget_50pct_used')}, "
+                f"75pct={row.get('date_budget_75pct_used')}, "
+                f"100pct={row.get('date_budget_100pct_used')}"
+            )
+        lines.extend(["", "## Crash Classification"])
+        classifications = audit[audit["section"].eq("budget_diagnostic_classification")]
+        for _, row in classifications.iterrows():
+            lines.append(
+                f"- {row.get('crash_window')}: classification={row.get('classification')}, "
+                f"budget_days={row.get('budget_exceeded_days')}, "
+                f"quote_days={row.get('quote_not_valid_days')}, "
+                f"no_contract_days={row.get('no_contract_found_days')}"
+            )
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- This audit describes allocation timing and blocked execution.",
+            "- No trades are created by this report.",
+            "- Quote quality, budget, and lifecycle failures remain visible.",
+        ]
+    )
+    text = "\n".join(lines) + "\n"
+    lowered = text.lower()
+    if "best" in lowered or "recommend" in lowered or "should increase" in lowered:
+        raise ValueError("hedge budget allocation audit contains disallowed wording")
     return text
 
 
