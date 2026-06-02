@@ -268,3 +268,80 @@ def test_recognition_debug_report_has_no_best_or_recommend(tmp_path) -> None:
 
     assert "best" not in text
     assert "recommend" not in text
+
+
+def test_new_schema_option_columns_normalize(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "new_schema.csv").write_text(
+        "交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,最高價,最低價,收盤價,成交量,結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,是否因訊息面暫停交易,交易時段\n"
+        "2020/01/02,CAO,202003,10000,買權,10,12,8,11,100,11,200,10,12,,一般\n"
+        "2020/01/02,CAO,202003,10000,賣權,9,11,7,10,100,10,200,9,11,,一般\n",
+        encoding="utf-8-sig",
+    )
+
+    out = module.load_official_options(opt_dir)
+
+    assert len(out) == 2
+    assert set(out["cp"]) == {"C", "P"}
+    assert set(["date", "expiry", "strike", "cp", "bid", "ask"]) <= set(out.columns)
+
+
+def test_english_schema_option_columns_normalize(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "english_schema.csv").write_text(
+        "Date,Contract,Expiry,Strike,CP,Open,High,Low,Close,Volume,Settlement,OI,Bid,Ask,Session\n"
+        "2020-01-02,TXO,202003,10000,C,10,12,8,11,100,11,200,10,12,regular\n",
+        encoding="utf-8-sig",
+    )
+
+    out = module.load_official_options(opt_dir)
+
+    assert len(out) == 1
+    assert out.iloc[0]["cp"] == "C"
+    assert out.iloc[0]["bid"] == 10
+    assert out.iloc[0]["ask"] == 12
+
+
+def test_schema_alias_does_not_override_existing_correct_column() -> None:
+    module = _prepare_real_data_module()
+    df = pd.DataFrame({"Date": ["2020-01-02"], "TradingDate": ["1999-01-01"], "Contract": ["TXO"]})
+
+    schema = module.detect_option_schema(df)
+
+    assert schema["date"] == "Date"
+
+
+def test_2018_2024_mock_schema_outputs_core_fields(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    opt_dir = tmp_path / "opt"
+    opt_dir.mkdir()
+    (opt_dir / "mock_2024.csv").write_text(
+        "交易日期,契約,到期月份(週別),履約價,買賣權,收盤價,成交量,未沖銷契約數,最後最佳買價,最後最佳賣價\n"
+        "2024/01/02,CAO,202403,18000,買權,100,10,100,99,101\n",
+        encoding="utf-8-sig",
+    )
+
+    out = module.load_official_options(opt_dir)
+
+    assert pd.notna(out.iloc[0]["date"])
+    assert pd.notna(out.iloc[0]["expiry"])
+    assert out.iloc[0]["strike"] == 18000
+    assert out.iloc[0]["cp"] == "C"
+    assert out.iloc[0]["bid"] == 99
+    assert out.iloc[0]["ask"] == 101
+
+
+def test_schema_mapping_audit_report_has_no_best_or_recommend(tmp_path) -> None:
+    module = _prepare_real_data_module()
+    path = tmp_path / "schema.md"
+    audit = pd.DataFrame([{"status": "PASS", "source_file": "x.csv", "missing_required_columns": "", "issue": ""}])
+
+    module.write_schema_mapping_audit_markdown(path, audit)
+    text = path.read_text(encoding="utf-8").lower()
+
+    assert "best" not in text
+    assert "recommend" not in text

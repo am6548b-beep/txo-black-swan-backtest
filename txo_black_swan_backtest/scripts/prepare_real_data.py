@@ -1,4 +1,4 @@
-"""Prepare raw TAIFEX/CrazyIndicator data into processed CSV files.
+﻿"""Prepare raw TAIFEX/CrazyIndicator data into processed CSV files.
 
 This script only performs data cleaning, normalization, and audit reporting.
 It does not run a backtest, estimate IV/delta, optimize parameters, or modify
@@ -67,6 +67,25 @@ OPTION_COLUMNS = [
     "source_file",
 ]
 
+DATE_ALIASES = ["\u4ea4\u6613\u65e5\u671f", "\u65e5\u671f", "Date", "TradingDate"]
+CONTRACT_ALIASES = ["\u5951\u7d04", "\u5546\u54c1", "\u5951\u7d04\u540d\u7a31", "\u5546\u54c1\u4ee3\u865f", "Contract"]
+EXPIRY_ALIASES = ["\u5230\u671f\u6708\u4efd(\u9031\u5225)", "\u5230\u671f\u6708\u4efd", "\u5230\u671f\u6708\u4efd(\u9031\u5225/\u6708\u4efd)", "\u5230\u671f\u5e74\u6708", "Expiry", "ContractMonth"]
+STRIKE_ALIASES = ["\u5c65\u7d04\u50f9", "\u5c65\u7d04\u50f9\u683c", "StrikePrice", "Strike"]
+CP_ALIASES = ["\u8cb7\u8ce3\u6b0a", "\u8cb7\u8ce3\u6b0a\u5225", "CallPut", "CP"]
+OPEN_ALIASES = ["\u958b\u76e4\u50f9", "\u958b\u76e4", "Open"]
+HIGH_ALIASES = ["\u6700\u9ad8\u50f9", "\u6700\u9ad8", "High"]
+LOW_ALIASES = ["\u6700\u4f4e\u50f9", "\u6700\u4f4e", "Low"]
+CLOSE_ALIASES = ["\u6700\u5f8c\u6210\u4ea4\u50f9", "\u6536\u76e4\u50f9", "\u6536\u76e4", "Close", "LastPrice"]
+VOLUME_ALIASES = ["\u6210\u4ea4\u91cf", "Volume"]
+SETTLEMENT_ALIASES = ["\u7d50\u7b97\u50f9", "SettlementPrice", "Settlement"]
+OPEN_INTEREST_ALIASES = ["\u672a\u6c96\u92b7\u5951\u7d04\u91cf", "\u672a\u6c96\u92b7\u5951\u7d04\u6578", "\u672a\u5e73\u5009\u91cf", "OpenInterest", "OI"]
+BID_ALIASES = ["\u6700\u5f8c\u6700\u4f73\u8cb7\u50f9", "\u6700\u4f73\u8cb7\u50f9", "\u8cb7\u50f9", "Bid"]
+ASK_ALIASES = ["\u6700\u5f8c\u6700\u4f73\u8ce3\u50f9", "\u6700\u4f73\u8ce3\u50f9", "\u8ce3\u50f9", "Ask"]
+HALT_ALIASES = ["\u662f\u5426\u56e0\u8a0a\u606f\u9762\u66ab\u505c\u4ea4\u6613", "\u66ab\u505c\u4ea4\u6613", "HaltFlag"]
+SESSION_ALIASES = ["\u4ea4\u6613\u6642\u6bb5", "\u6642\u6bb5", "Session"]
+TXO_CONTRACT_ALIASES = {"TXO", "CAO"}
+SCHEMA_AUDIT_ROWS: list[dict[str, object]] = []
+
 
 @dataclass(frozen=True)
 class AuditItem:
@@ -85,6 +104,8 @@ class ExpiryCalendar:
 
 
 def main() -> None:
+    global SCHEMA_AUDIT_ROWS
+    SCHEMA_AUDIT_ROWS = []
     args = parse_args()
     raw_dir = Path(args.raw_dir)
     out_dir = Path(args.out_dir)
@@ -104,6 +125,9 @@ def main() -> None:
     audit = build_audit(market, options, txf_market, official_market, expiry_calendar)
     audit_df = pd.DataFrame([item.__dict__ for item in audit])
     audit_df.to_csv(report_dir / "data_cleaning_audit.csv", index=False)
+    schema_audit = pd.DataFrame(SCHEMA_AUDIT_ROWS)
+    schema_audit.to_csv(report_dir / "schema_mapping_audit.csv", index=False)
+    write_schema_mapping_audit_markdown(report_dir / "schema_mapping_audit.md", schema_audit)
     debug_counts = write_debug_outputs(report_dir, options)
     write_quote_quality_reports(report_dir, options)
     raw_inventory = build_raw_options_file_inventory(raw_dir / "taifex" / "opt", options)
@@ -122,6 +146,8 @@ def main() -> None:
     print(f"wrote {out_dir / 'options.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.csv'}")
     print(f"wrote {report_dir / 'data_cleaning_audit.md'}")
+    print(f"wrote {report_dir / 'schema_mapping_audit.csv'}")
+    print(f"wrote {report_dir / 'schema_mapping_audit.md'}")
     print(f"wrote {report_dir / 'raw_options_file_inventory.csv'}")
     print(f"wrote {report_dir / 'raw_options_file_inventory.md'}")
     print(f"wrote {report_dir / 'raw_options_file_recognition_debug.csv'}")
@@ -186,12 +212,12 @@ def load_official_futures(fut_dir: Path) -> pd.DataFrame:
         if df.empty:
             continue
         df = normalize_columns(df)
-        date_col = first_col(df, ["交易日期", "日期"])
-        contract_col = first_col(df, ["契約"])
-        expiry_col = first_col(df, ["到期月份(週別)", "到期月份"])
+        date_col = first_col(df, DATE_ALIASES)
+        contract_col = first_col(df, CONTRACT_ALIASES)
+        expiry_col = first_col(df, EXPIRY_ALIASES)
         if date_col is None or contract_col is None:
             continue
-        tx = df[df[contract_col].astype(str).str.strip().eq("TX")].copy()
+        tx = df[df[contract_col].astype(str).str.strip().str.upper().eq("TX")].copy()
         if tx.empty:
             continue
         work = pd.DataFrame()
@@ -199,12 +225,12 @@ def load_official_futures(fut_dir: Path) -> pd.DataFrame:
         work["contract"] = tx[contract_col].astype(str).str.strip()
         work["expiry_raw"] = tx[expiry_col].astype(str).str.strip() if expiry_col else ""
         work["expiry_key"] = expiry_sort_key(work["expiry_raw"])
-        work["tx_open"] = to_number(col_or_nan(tx, ["開盤價"]))
-        work["tx_high"] = to_number(col_or_nan(tx, ["最高價"]))
-        work["tx_low"] = to_number(col_or_nan(tx, ["最低價"]))
-        work["tx_close"] = to_number(col_or_nan(tx, ["收盤價", "最後成交價"]))
+        work["tx_open"] = to_number(col_or_nan(tx, OPEN_ALIASES))
+        work["tx_high"] = to_number(col_or_nan(tx, HIGH_ALIASES))
+        work["tx_low"] = to_number(col_or_nan(tx, LOW_ALIASES))
+        work["tx_close"] = to_number(col_or_nan(tx, CLOSE_ALIASES))
         work["txf_close"] = work["tx_close"]
-        work["volume"] = to_number(col_or_nan(tx, ["成交量"])).fillna(0)
+        work["volume"] = to_number(col_or_nan(tx, VOLUME_ALIASES)).fillna(0)
         work["source_file"] = path.name
         work = work.dropna(subset=["date"]).sort_values(["date", "expiry_key", "volume"], ascending=[True, True, False])
         selected = work.groupby("date", as_index=False).first()
@@ -231,19 +257,31 @@ def load_official_options(opt_dir: Path, expiry_calendar: ExpiryCalendar | None 
     for path in sorted(opt_dir.glob("*.csv")):
         df = read_csv_with_encoding(path)
         if df.empty:
+            append_schema_audit(path, df, "unknown", {}, ["date", "contract", "expiry_raw", "strike", "cp"], 0, "FAIL", "empty_or_unreadable")
             continue
         df = normalize_columns(df)
-        date_col = first_col(df, ["交易日期", "日期"])
+        schema = detect_option_schema(df)
+        date_col = schema.get("date") or first_col(df, ["鈭斗??交?", "?交?"])
         if date_col is None:
+            append_schema_audit(path, df, "unknown", schema, ["date"], 0, "FAIL", "missing date column")
             continue
-        contract = col_or_nan(df, ["契約"]).astype(str).str.strip()
-        txo = df[contract.eq("TXO")].copy()
+        contract_col = schema.get("contract") or first_col(df, ["憟?"])
+        if contract_col is None:
+            append_schema_audit(path, df, "unknown", schema, ["contract"], 0, "FAIL", "missing contract column")
+            continue
+        contract = df[contract_col].astype(str).str.strip().str.upper()
+        txo = df[contract.isin(TXO_CONTRACT_ALIASES)].copy()
         if txo.empty:
+            append_schema_audit(path, df, schema_version(schema), schema, [], 0, "FAIL", "no TXO/CAO rows")
+            continue
+        required_missing = [name for name in ["date", "contract", "expiry_raw", "strike", "cp"] if schema.get(name) is None]
+        if required_missing:
+            append_schema_audit(path, df, schema_version(schema), schema, required_missing, 0, "FAIL", "missing required columns")
             continue
         out = pd.DataFrame()
         out["date"] = parse_date(txo[date_col])
-        out["contract"] = col_or_nan(txo, ["契約"]).astype(str).str.strip()
-        expiry_raw = col_or_nan(txo, ["到期月份(週別)", "到期月份"]).astype(str).str.strip()
+        out["contract"] = txo[contract_col].astype(str).str.strip()
+        expiry_raw = txo[schema["expiry_raw"]].astype(str).str.strip()
         out["expiry_raw"] = expiry_raw
         rule_lookup = {raw: parse_expiry_by_rule(raw) for raw in expiry_raw.dropna().unique()}
         expiry_lookup = {raw: parse_taifex_expiry(raw, expiry_calendar.overrides if expiry_calendar else None) for raw in expiry_raw.dropna().unique()}
@@ -255,19 +293,19 @@ def load_official_options(opt_dir: Path, expiry_calendar: ExpiryCalendar | None 
             bool(raw in expiry_calendar.overrides and pd.notna(expiry_calendar.overrides[raw])) if expiry_calendar else False
             for raw in expiry_raw
         ]
-        out["cp"] = col_or_nan(txo, ["買賣權"]).map(normalize_cp)
-        out["strike"] = to_number(col_or_nan(txo, ["履約價"]))
-        out["open"] = to_number(col_or_nan(txo, ["開盤價"]))
-        out["high"] = to_number(col_or_nan(txo, ["最高價"]))
-        out["low"] = to_number(col_or_nan(txo, ["最低價"]))
-        out["close"] = to_number(col_or_nan(txo, ["最後成交價", "收盤價"]))
-        out["bid"] = to_number(col_or_nan(txo, ["最後最佳買價"]))
-        out["ask"] = to_number(col_or_nan(txo, ["最後最佳賣價"]))
-        out["volume"] = to_number(col_or_nan(txo, ["成交量"])).fillna(0)
-        out["open_interest"] = to_number(col_or_nan(txo, ["未沖銷契約量", "未沖銷契約數"]))
-        out["settlement_price"] = to_number(col_or_nan(txo, ["結算價"]))
-        out["halt_flag"] = col_or_nan(txo, ["是否因訊息面暫停交易"])
-        out["session"] = col_or_nan(txo, ["交易時段"])
+        out["cp"] = txo[schema["cp"]].map(normalize_cp)
+        out["strike"] = to_number(txo[schema["strike"]])
+        out["open"] = to_number(txo[schema["open"]]) if schema.get("open") else np.nan
+        out["high"] = to_number(txo[schema["high"]]) if schema.get("high") else np.nan
+        out["low"] = to_number(txo[schema["low"]]) if schema.get("low") else np.nan
+        out["close"] = to_number(txo[schema["close"]]) if schema.get("close") else np.nan
+        out["bid"] = to_number(txo[schema["bid"]]) if schema.get("bid") else np.nan
+        out["ask"] = to_number(txo[schema["ask"]]) if schema.get("ask") else np.nan
+        out["volume"] = (to_number(txo[schema["volume"]]) if schema.get("volume") else pd.Series(np.nan, index=txo.index)).fillna(0)
+        out["open_interest"] = to_number(txo[schema["open_interest"]]) if schema.get("open_interest") else np.nan
+        out["settlement_price"] = to_number(txo[schema["settlement_price"]]) if schema.get("settlement_price") else np.nan
+        out["halt_flag"] = txo[schema["halt_flag"]] if schema.get("halt_flag") else ""
+        out["session"] = txo[schema["session"]] if schema.get("session") else ""
         out["is_weekly"] = expiry_raw.str.contains("W", case=False, na=False)
         out["iv"] = np.nan
         out["delta"] = np.nan
@@ -277,8 +315,99 @@ def load_official_options(opt_dir: Path, expiry_calendar: ExpiryCalendar | None 
         out = add_quote_quality_columns(out)
         out["data_source"] = "taifex_official_daily"
         out["source_file"] = path.name
+        append_schema_audit(path, df, schema_version(schema), schema, [], len(out), "PASS", "")
         frames.append(out[OPTION_COLUMNS + ["expiry_raw", "rule_expiry", "rule_dte", "override_used"]])
     return concat_or_empty(frames, OPTION_COLUMNS + ["expiry_raw", "rule_expiry", "rule_dte", "override_used"]).reset_index(drop=True)
+
+
+def detect_option_schema(df: pd.DataFrame) -> dict[str, str | None]:
+    return {
+        "date": first_col(df, DATE_ALIASES),
+        "contract": first_col(df, CONTRACT_ALIASES),
+        "expiry_raw": first_col(df, EXPIRY_ALIASES),
+        "strike": first_col(df, STRIKE_ALIASES),
+        "cp": first_col(df, CP_ALIASES),
+        "open": first_col(df, OPEN_ALIASES),
+        "high": first_col(df, HIGH_ALIASES),
+        "low": first_col(df, LOW_ALIASES),
+        "close": first_col(df, CLOSE_ALIASES),
+        "volume": first_col(df, VOLUME_ALIASES),
+        "settlement_price": first_col(df, SETTLEMENT_ALIASES),
+        "open_interest": first_col(df, OPEN_INTEREST_ALIASES),
+        "bid": first_col(df, BID_ALIASES),
+        "ask": first_col(df, ASK_ALIASES),
+        "halt_flag": first_col(df, HALT_ALIASES),
+        "session": first_col(df, SESSION_ALIASES),
+    }
+
+
+def schema_version(schema: dict[str, str | None]) -> str:
+    mapped = {value for value in schema.values() if value}
+    if any(value in mapped for value in DATE_ALIASES + CONTRACT_ALIASES):
+        return "alias_schema"
+    return "legacy_schema"
+
+
+def append_schema_audit(
+    path: Path,
+    df: pd.DataFrame,
+    detected_schema_version: str,
+    schema: dict[str, str | None],
+    missing_required_columns: list[str],
+    normalized_rows: int,
+    status: str,
+    issue: str,
+) -> None:
+    dates = parse_date(df[schema["date"]]) if schema.get("date") and schema["date"] in df else pd.Series(dtype="datetime64[ns]")
+    dates = dates.dropna()
+    years = sorted({int(year) for year in dates.dt.year.dropna().unique()}) if not dates.empty else []
+    SCHEMA_AUDIT_ROWS.append(
+        {
+            "source_file": path.name,
+            "detected_schema_version": detected_schema_version,
+            "mapped_columns": ";".join(f"{key}={value}" for key, value in schema.items() if value),
+            "missing_required_columns": ";".join(missing_required_columns),
+            "normalized_rows": int(normalized_rows),
+            "date_min": str(dates.min().date()) if not dates.empty else "",
+            "date_max": str(dates.max().date()) if not dates.empty else "",
+            "years_covered": ";".join(map(str, years)),
+            "status": status,
+            "issue": issue,
+        }
+    )
+
+
+def write_schema_mapping_audit_markdown(path: Path, audit: pd.DataFrame) -> None:
+    counts = audit["status"].value_counts().to_dict() if not audit.empty else {}
+    lines = [
+        "# Schema Mapping Audit",
+        "",
+        "This report audits raw option schema mapping only. It does not modify strategy rules, prices, quote quality, formulas, or trades.",
+        "",
+        "## Status Counts",
+        "",
+    ]
+    for status in ["PASS", "WARN", "FAIL"]:
+        lines.append(f"- {status}: {int(counts.get(status, 0))}")
+    lines.extend(["", "## Failures", ""])
+    failures = audit[audit["status"] == "FAIL"] if not audit.empty else pd.DataFrame()
+    if failures.empty:
+        lines.append("- none")
+    else:
+        for row in failures.head(50).itertuples(index=False):
+            lines.append(f"- {row.source_file}: missing={row.missing_required_columns}, issue={row.issue}")
+    lines.extend(
+        [
+            "",
+            "## Required Limitations",
+            "",
+            "- Existing legacy schema support is retained.",
+            "- No raw rows are deleted.",
+            "- No bid/ask repair or price filling is performed.",
+            "- No backtest is run by this audit.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def build_audit(
@@ -466,7 +595,7 @@ def read_csv_with_encoding(path: Path) -> pd.DataFrame:
     last_exc: Exception | None = None
     for encoding in ENCODINGS:
         try:
-            return pd.read_csv(path, encoding=encoding, low_memory=False)
+            return pd.read_csv(path, encoding=encoding, low_memory=False, index_col=False)
         except UnicodeDecodeError as exc:
             last_exc = exc
             continue
@@ -479,7 +608,7 @@ def read_csv_with_detected_encoding(path: Path, nrows: int | None = None) -> tup
     last_exc: Exception | None = None
     for encoding in ENCODINGS:
         try:
-            return pd.read_csv(path, encoding=encoding, low_memory=False, nrows=nrows), encoding, ""
+            return pd.read_csv(path, encoding=encoding, low_memory=False, nrows=nrows, index_col=False), encoding, ""
         except UnicodeDecodeError as exc:
             last_exc = exc
             continue
@@ -557,8 +686,8 @@ def raw_options_file_inventory_row(path: Path) -> dict[str, object]:
     if df.empty:
         base["normalization_error"] = "empty_file"
         return base
-    date_col = first_col(df, ["交易日期", "日期", "Date", "date", "鈭斗??交?", "?交?"])
-    contract_col = first_col(df, ["契約", "contract", "Contract", "憟?"])
+    date_col = first_col(df, ["鈭斗??交?", "?交?", "Date", "date", "?剜???鈭?", "?鈭?"])
+    contract_col = first_col(df, ["憟?", "contract", "Contract", "??"])
     if date_col is None:
         base["normalization_error"] = "missing_date_column"
         return base
@@ -994,7 +1123,7 @@ def detect_date_columns(df: pd.DataFrame) -> list[str]:
         name = str(col).lower()
         values = df[col].dropna().astype(str).head(100)
         parsed = parse_mixed_taifex_dates(values)
-        if any(token in name for token in ["date", "日期", "交易日", "交?"]) or parsed.notna().sum() >= max(3, min(10, len(values)) // 2):
+        if any(token in name for token in ["date", "\u65e5\u671f", "\u4ea4\u6613\u65e5"]) or parsed.notna().sum() >= max(3, min(10, len(values)) // 2):
             cols.append(str(col))
     return cols
 
@@ -1048,7 +1177,7 @@ def detect_contract_columns(df: pd.DataFrame) -> list[str]:
     for col in df.columns:
         name = str(col).lower()
         values = df[col].dropna().astype(str).str.upper().head(500)
-        if any(token in name for token in ["contract", "契約", "憟"]) or values.eq("TXO").any():
+        if any(token in name for token in ["contract", "\u5951\u7d04", "\u5546\u54c1"]) or values.isin(TXO_CONTRACT_ALIASES).any():
             cols.append(str(col))
     return cols
 
@@ -1058,7 +1187,7 @@ def detect_cp_columns(df: pd.DataFrame) -> list[str]:
     for col in df.columns:
         name = str(col).lower()
         values = df[col].dropna().astype(str).str.upper().head(500)
-        if any(token in name for token in ["買賣權", "cp", "call", "put"]) or values.isin(["C", "P", "CALL", "PUT"]).any() or values.str.contains("買權|賣權|CALL|PUT", regex=True).any():
+        if any(token in name for token in ["\u8cb7\u8ce3\u6b0a", "cp", "call", "put"]) or values.isin(["C", "P", "CALL", "PUT"]).any() or values.str.contains("\u8cb7\u6b0a|\u8ce3\u6b0a|CALL|PUT", regex=True).any():
             cols.append(str(col))
     return cols
 
@@ -1068,7 +1197,7 @@ def detect_strike_columns(df: pd.DataFrame) -> list[str]:
     for col in df.columns:
         name = str(col).lower()
         numeric = pd.to_numeric(df[col], errors="coerce")
-        if any(token in name for token in ["履約", "strike", "撅"]) or numeric.between(1000, 50000).sum() >= max(3, min(20, len(df)) // 2):
+        if any(token in name for token in ["\u5c65\u7d04", "strike"]) or numeric.between(1000, 50000).sum() >= max(3, min(20, len(df)) // 2):
             cols.append(str(col))
     return cols
 
@@ -1085,8 +1214,8 @@ def count_txo_rows(df: pd.DataFrame, contract_cols: list[str]) -> int:
 def prepare_real_data_normalizable_status(path: Path, df: pd.DataFrame) -> tuple[bool, str]:
     if path.suffix.lower() != ".csv":
         return False, "UNSUPPORTED_EXTENSION"
-    date_col = first_col(df, ["鈭斗??交?", "?交?"])
-    contract_col = first_col(df, ["憟?"])
+    date_col = first_col(df, ["?剜???鈭?", "?鈭?"])
+    contract_col = first_col(df, ["??"])
     if date_col is None or contract_col is None:
         return False, "COLUMN_MAPPING_GAP"
     txo = df[df[contract_col].astype(str).str.strip().eq("TXO")]
@@ -1192,7 +1321,7 @@ def parse_date(values: pd.Series) -> pd.Series:
 
 def normalize_cp(value: object) -> str | float:
     text = str(value).strip().upper()
-    mapping = {"買權": "C", "賣權": "P", "CALL": "C", "PUT": "P", "C": "C", "P": "P"}
+    mapping = {"鞎瑟?": "C", "鞈??": "P", "\u8cb7\u6b0a": "C", "\u8ce3\u6b0a": "P", "CALL": "C", "PUT": "P", "C": "C", "P": "P"}
     return mapping.get(text, np.nan)
 
 
@@ -1611,3 +1740,5 @@ def expiry_raw_pattern(value: object) -> str:
 
 if __name__ == "__main__":
     main()
+
+
