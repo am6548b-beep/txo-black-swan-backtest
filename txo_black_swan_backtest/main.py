@@ -18,6 +18,7 @@ from src.put_spread_coverage import write_put_spread_coverage_audit
 from src.put_spread_variants import run_put_spread_variants
 from src.reports import write_reports
 from src.report_auditor import run_report_audit
+from src.risk_scaled_hedge import run_risk_scaled_hedge_simulation
 from src.stress_tests import run_stress_suite
 from src.utils import ensure_dirs, load_config_module
 from src.walk_forward import run_walk_forward
@@ -43,6 +44,7 @@ def parse_args() -> argparse.Namespace:
             "put_spread_coverage",
             "put_spread_variants",
             "hedge_need_diagnostics",
+            "risk_scaled_hedge_simulation",
         ],
     )
     parser.add_argument("--data-dir", default=None, help="Override runtime data directory")
@@ -125,6 +127,14 @@ def main() -> None:
         print(f"Hedge coverage timeline written to {root / 'reports' / 'hedge_coverage_timeline.csv'}")
         print(f"Hedge gap audit written to {root / 'reports' / 'hedge_gap_audit.csv'}")
         print(f"Rows: score={len(score)}, coverage={len(coverage)}, audit={len(audit)}")
+        return
+
+    if args.mode == "risk_scaled_hedge_simulation":
+        summary, trades, coverage = run_risk_scaled_hedge_simulation(processed_data_dir, root / "reports", config, put_params, ic_params)
+        print(f"Risk-scaled hedge simulation written to {root / 'reports' / 'risk_scaled_hedge_simulation.csv'}")
+        print(f"Risk-scaled hedge trades written to {root / 'reports' / 'risk_scaled_hedge_trades.csv'}")
+        print(f"Risk-scaled hedge coverage written to {root / 'reports' / 'risk_scaled_hedge_coverage.csv'}")
+        print(f"Rows: summary={len(summary)}, trades={len(trades)}, coverage={len(coverage)}")
         return
 
     if args.mode == "stress":
